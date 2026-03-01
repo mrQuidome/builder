@@ -121,7 +121,7 @@ def call_claude(prompt: str, label: str) -> str:
     log.info(f"  [claude] {label}...")
     try:
         result = subprocess.run(
-            ["claude", "--print", prompt],
+            ["claude", "--print", "--dangerously-skip-permissions", prompt],
             capture_output=True,
             text=True,
             timeout=CLAUDE_TIMEOUT,

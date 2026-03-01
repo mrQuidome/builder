@@ -233,7 +233,7 @@ def run_claude(prompt: str, step_num: int, agent: str, project_dir: str) -> str:
     log.info(f"  [{agent}] invoking claude...")
     try:
         result = subprocess.run(
-            ["claude", "--print", prompt],
+            ["claude", "--print", "--dangerously-skip-permissions", prompt],
             capture_output=True,
             text=True,
             timeout=CLAUDE_TIMEOUT,
