@@ -13,12 +13,14 @@ Usage:
 Requirements:
     claude CLI must be installed and authenticated on this machine.
     Must be run as root or sudo on the target VPS.
-    Fill in all <REPLACE_ME> secrets in setup_config.json before running.
+    Fill in external secrets (source=external) in setup_config.json before running.
+    Secrets with source=generate will be auto-generated.
 """
 
 import argparse
 import json
 import logging
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -69,6 +71,10 @@ ENV VARS AVAILABLE:
 {env_json}
 
 INSTRUCTIONS:
+- For database services (e.g. postgresql): create the database user and database
+  using the credentials from the env vars. Extract the username, password, and
+  database name from DATABASE_URL. Enable required extensions (e.g. PostGIS,
+  pgRouting) inside the database.
 - Apply all config_files changes described in the spec.
 - Enable and start the systemd unit if specified.
 - Run the validate_cmd and confirm output contains validate_expect.
@@ -76,6 +82,27 @@ INSTRUCTIONS:
   AGENT_RESULT: DONE
   AGENT_RESULT: FAILED
   REASON: <what went wrong>
+""".strip()
+
+GENERATE_SECRETS_PROMPT = """
+You are a system setup agent running on {os} as {run_as}.
+
+Generate secure values for the following secrets. Each one has source "generate",
+meaning it should be created locally — not obtained from any external service.
+
+SECRETS TO GENERATE:
+{secrets_json}
+
+INSTRUCTIONS:
+- For database passwords: generate a random 32-character alphanumeric password.
+- For JWT secrets: generate a random 64-character hex string.
+- For connection strings (like DATABASE_URL): construct the full connection string
+  using the generated password. Use the template in the current value if available.
+- For any other generate-type secret: produce an appropriate secure random value.
+- Output ONLY a single valid JSON object mapping each variable name to its
+  generated value. No markdown, no explanation, no code fences.
+- Example output:
+  {{"JWT_SECRET": "a1b2c3...", "DATABASE_URL": "postgres://user:pass@host/db"}}
 """.strip()
 
 SETUP_ENV_PROMPT = """
@@ -174,15 +201,16 @@ def parse_result(output: str) -> str:
 
 
 def check_secrets(config: dict) -> bool:
+    """Only block on external secrets that still have <REPLACE_*> placeholders."""
     bad = [
         v["name"] for v in config.get("env_vars", [])
-        if "<REPLACE" in str(v.get("value", ""))
+        if v.get("source") == "external" and "<REPLACE" in str(v.get("value", ""))
     ]
     if bad:
-        log.error("The following secrets have not been filled in:")
+        log.error("The following external secrets have not been filled in:")
         for name in bad:
             log.error(f"  {name}")
-        log.error(f"Edit {DEFAULT_CONFIG} and replace all <REPLACE_*> placeholders.")
+        log.error(f"Edit {DEFAULT_CONFIG} and replace all <REPLACE_*> placeholders for external secrets.")
         return False
     return True
 
@@ -203,6 +231,57 @@ def save_config(config: dict, path: str):
 # ---------------------------------------------------------------------------
 # Phase runners
 # ---------------------------------------------------------------------------
+
+def run_generate_secrets(config: dict) -> bool:
+    """Phase 0: auto-generate secrets marked with source=generate."""
+    gen_vars = [v for v in config["env_vars"] if v.get("source") == "generate"]
+    if not gen_vars:
+        log.info("  No secrets to auto-generate.")
+        return True
+
+    log.info(f"\n{'='*60}")
+    log.info(f"PHASE: Auto-generate secrets ({len(gen_vars)} secrets)")
+    log.info(f"{'='*60}")
+
+    prompt = GENERATE_SECRETS_PROMPT.format(
+        os=config["system"]["os"],
+        run_as=config["system"]["run_as"],
+        secrets_json=json.dumps(gen_vars, indent=2),
+    )
+
+    output = call_claude(prompt, "generate_secrets")
+
+    # Parse the JSON mapping from the output
+    try:
+        # Try to extract JSON from the output (may be wrapped in fences)
+        match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", output)
+        if match:
+            text = match.group(1).strip()
+        else:
+            match_open = re.search(r"```(?:json)?\s*\n", output)
+            text = output[match_open.end():].strip() if match_open else output.strip()
+        generated = json.loads(text)
+    except (json.JSONDecodeError, AttributeError) as e:
+        log.error(f"  Failed to parse generated secrets: {e}")
+        log.error(f"  Raw output:\n{output[:500]}")
+        record_result(config, "secrets", "generate", "failed", str(e))
+        return False
+
+    # Write generated values back into the config
+    updated = 0
+    for var in config["env_vars"]:
+        if var["name"] in generated:
+            var["value"] = generated[var["name"]]
+            updated += 1
+            log.info(f"  Generated: {var['name']}")
+
+    if updated < len(gen_vars):
+        missing = [v["name"] for v in gen_vars if v["name"] not in generated]
+        log.warning(f"  Missing generated values for: {', '.join(missing)}")
+
+    record_result(config, "secrets", "generate", "ok", f"{updated} secrets generated")
+    return True
+
 
 def run_env_setup(config: dict) -> bool:
     log.info(f"\n{'='*60}")
@@ -306,11 +385,18 @@ def main():
     log.info(f"Tools   : {len(config['tools'])}")
     log.info(f"Services: {len(config['services'])}")
 
-    # Guard: refuse to run with unfilled secrets
+    # Guard: refuse to run with unfilled external secrets
     if not check_secrets(config):
         sys.exit(1)
 
     failed = []
+
+    # --- Phase 0: auto-generate secrets ---
+    if not run_generate_secrets(config):
+        log.error("Secret generation failed — cannot continue.")
+        save_config(config, args.config)
+        sys.exit(1)
+    save_config(config, args.config)
 
     # --- Phase 1: env vars and directories ---
     if not run_env_setup(config):

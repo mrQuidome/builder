@@ -2,13 +2,12 @@
 """
 Planner Agent
 
-Reads a technical design markdown file and produces two JSON files:
+Reads a technical design markdown file and produces a sequenced build plan:
   - unwalked_build_plan.json   sequential build steps for the orchestrator
-  - setup_config.json          all tools, versions, credentials, env vars
 
 Usage:
     python planner.py design.md
-    python planner.py design.md --plan my_plan.json --config my_config.json
+    python planner.py design.md --plan my_plan.json
 
 Requirements:
     claude CLI must be installed and authenticated on this machine.
@@ -16,24 +15,20 @@ Requirements:
 
 import argparse
 import json
-import logging
-import re
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+from planner_common import call_claude, extract_json, save_raw, setup_logging
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_PLAN    = "unwalked_build_plan.json"
-DEFAULT_CONFIG  = "setup_config.json"
-CLAUDE_TIMEOUT  = 600
-LOG_FILE        = "planner.log"
+DEFAULT_PLAN = "unwalked_build_plan.json"
 
 # ---------------------------------------------------------------------------
-# Prompts — two separate claude calls to keep output focused
+# Prompt
 # ---------------------------------------------------------------------------
 
 PLAN_PROMPT = """
@@ -83,162 +78,16 @@ CHUNKING RULES:
 - Do not mix unrelated concerns in one step
 """.strip()
 
-SETUP_PROMPT = """
-You are a Setup Config Extractor. Read the technical design and extract all
-information needed to set up the build environment and external services.
-
-TECHNICAL DESIGN:
-{design}
-
-OUTPUT RULES:
-- Output ONLY a single valid JSON object. No markdown, no explanation, no code fences.
-- Extract every tool, version, credential placeholder, environment variable,
-  and configuration choice mentioned in the design.
-- For secrets and passwords use placeholder strings like "<REPLACE_WITH_DB_PASSWORD>"
-  so the operator knows they must fill these in before running setup.
-- Output this exact shape:
-  {{
-    "status": "ok",
-    "project": "<project name>",
-    "system": {{
-      "os": "<target OS>",
-      "run_as": "<user, e.g. root>"
-    }},
-    "tools": [
-      {{
-        "name": "<tool name>",
-        "version": "<pinned version or 'latest stable'>",
-        "install_method": "<apt | cargo | wget | build_from_source | pip | npm>",
-        "install_notes": "<any special steps from the design>",
-        "validate_cmd": "<command to confirm install succeeded>",
-        "validate_expect": "<expected output or substring>"
-      }}
-    ],
-    "services": [
-      {{
-        "name": "<service name e.g. postgresql>",
-        "config_files": [
-          {{
-            "path": "<absolute path>",
-            "notes": "<what to configure and why>"
-          }}
-        ],
-        "systemd_unit": "<unit name or null>",
-        "validate_cmd": "<command to confirm service is healthy>",
-        "validate_expect": "<expected output or substring>"
-      }}
-    ],
-    "env_vars": [
-      {{
-        "name": "<VAR_NAME>",
-        "description": "<what it is used for>",
-        "secret": <true|false>,
-        "default": "<default value or null>",
-        "value": "<actual value or placeholder like <REPLACE_ME>>"
-      }}
-    ],
-    "project_dirs": [
-      {{
-        "name": "<logical name e.g. api_server>",
-        "path": "<absolute path on VPS>",
-        "notes": "<what lives here>"
-      }}
-    ]
-  }}
-""".strip()
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def restore_terminal():
-    """Restore terminal to sane state after a subprocess messes it up."""
-    try:
-        subprocess.run(["stty", "sane"], stdin=open("/dev/tty"), check=False)
-    except Exception:
-        pass
-
-
-def call_claude(prompt: str, label: str) -> str:
-    slug = label.replace(" ", "_")
-    stdout_path = f"claude_{slug}_stdout.log"
-    stderr_path = f"claude_{slug}_stderr.log"
-    log.info(f"Calling claude [{label}]  stdout -> {stdout_path}  stderr -> {stderr_path}")
-
-    with open(stdout_path, "w") as fout, open(stderr_path, "w") as ferr:
-        try:
-            proc = subprocess.Popen(
-                ["claude", "--print", "--dangerously-skip-permissions"],
-                stdin=subprocess.PIPE,
-                stdout=fout,
-                stderr=ferr,
-            )
-            proc.stdin.write(prompt.encode())
-            proc.stdin.close()
-            proc.wait(timeout=CLAUDE_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            restore_terminal()
-            log.error(f"Claude timed out after {CLAUDE_TIMEOUT}s — check {stdout_path} and {stderr_path} for partial output")
-            sys.exit(1)
-        except FileNotFoundError:
-            log.error("claude CLI not found — is it installed and on PATH?")
-            sys.exit(1)
-
-    if proc.returncode != 0:
-        restore_terminal()
-        stderr_content = Path(stderr_path).read_text().strip()
-        log.warning(f"claude exited {proc.returncode}: {stderr_content}")
-
-    output = Path(stdout_path).read_text().strip()
-    return output
-
-
-def extract_json(raw: str) -> dict:
-    # Try matched opening + closing fences first
-    match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", raw)
-    if match:
-        text = match.group(1).strip()
-    else:
-        # Handle opening fence with no closing fence
-        match_open = re.search(r"```(?:json)?\s*\n", raw)
-        text = raw[match_open.end():].strip() if match_open else raw.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        log.error(f"Failed to parse JSON: {e}")
-        log.error(f"Raw output:\n{raw[:500]}")
-        sys.exit(1)
-
-
-def save_raw(raw: str, filename: str):
-    Path(filename).write_text(raw)
-    log.info(f"Raw output saved to {filename}")
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Planner Agent")
-    parser.add_argument("design",    help="Path to technical design markdown file")
-    parser.add_argument("--plan",    default=DEFAULT_PLAN,   help="Build plan output path")
-    parser.add_argument("--config",  default=DEFAULT_CONFIG, help="Setup config output path")
+    log = setup_logging("planner.log")
+
+    parser = argparse.ArgumentParser(description="Planner Agent — build plan generator")
+    parser.add_argument("design", help="Path to technical design markdown file")
+    parser.add_argument("--plan", default=DEFAULT_PLAN, help="Build plan output path")
     args = parser.parse_args()
 
     design_path = Path(args.design)
@@ -249,12 +98,11 @@ def main():
     design = design_path.read_text()
     log.info(f"Design  : {design_path} ({len(design)} chars)")
     log.info(f"Plan    : {args.plan}")
-    log.info(f"Config  : {args.config}")
 
     # --- Build plan ---
-    raw_plan = call_claude(PLAN_PROMPT.format(design=design), "build plan")
-    save_raw(raw_plan, "planner_raw_plan.txt")
-    plan = extract_json(raw_plan)
+    raw_plan = call_claude(PLAN_PROMPT.format(design=design), "build_plan", log)
+    save_raw(raw_plan, "planner_raw_plan.txt", log)
+    plan = extract_json(raw_plan, log)
 
     if plan.get("status") == "blocked":
         log.error("\nPlanner found blockers — cannot produce a build plan.")
@@ -267,7 +115,7 @@ def main():
         log.error(f"Unexpected plan status: {plan.get('status')}")
         sys.exit(1)
 
-    plan["generated_at"]  = datetime.now().isoformat()
+    plan["generated_at"] = datetime.now().isoformat()
     plan["source_design"] = str(design_path)
 
     Path(args.plan).write_text(json.dumps(plan, indent=2))
@@ -275,36 +123,7 @@ def main():
     for s in plan["steps"]:
         log.info(f"  Step {s['step']:02d}: {s['title']}")
 
-    # --- Setup config ---
-    raw_config = call_claude(SETUP_PROMPT.format(design=design), "setup config")
-    save_raw(raw_config, "planner_raw_config.txt")
-    config = extract_json(raw_config)
-
-    if config.get("status") != "ok":
-        log.error(f"Unexpected config status: {config.get('status')}")
-        sys.exit(1)
-
-    config["generated_at"]  = datetime.now().isoformat()
-    config["source_design"] = str(design_path)
-    config["install_results"] = []   # setup.py will populate this
-
-    Path(args.config).write_text(json.dumps(config, indent=2))
-    log.info(f"\nSetup config: {len(config['tools'])} tools, "
-             f"{len(config['services'])} services, "
-             f"{len(config['env_vars'])} env vars")
-
-    # Warn about secrets that need filling in
-    secrets = [v for v in config["env_vars"] if v["secret"] and "<REPLACE" in str(v.get("value", ""))]
-    if secrets:
-        log.warning(f"\n  {len(secrets)} secret(s) need values before running setup.py:")
-        for s in secrets:
-            log.warning(f"    {s['name']}: {s['description']}")
-        log.warning(f"  Edit {args.config} and fill in these values first.\n")
-
-    log.info(f"\nNext steps:")
-    log.info(f"  1. Fill in secrets in {args.config}")
-    log.info(f"  2. python setup.py --config {args.config}")
-    log.info(f"  3. python orchestrator.py --plan {args.plan} --config {args.config}")
+    log.info(f"\nDone. Next: python setup_planner.py {args.design}")
 
 
 if __name__ == "__main__":
