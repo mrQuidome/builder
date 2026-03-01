@@ -161,6 +161,90 @@ If the code is clean and within scope output:
   AGENT_RESULT: PASS
 """.strip()
 
+DEV_TEST_FIX_PROMPT = """
+You are a senior developer fixing test failures found by the QA engineer.
+
+STEP:
+{step_json}
+
+PROJECT DIR: {project_dir}
+
+ENVIRONMENT:
+{env_summary}
+
+PRODUCTION COMPONENTS ALREADY INSTALLED (do not add to these):
+{production_components}
+
+TEST FAILURES TO FIX:
+{test_failures}
+
+INSTRUCTIONS:
+- Fix EVERY test failure listed above. Do not skip any.
+- The Definition of Done for the step must still be fully met.
+- Run builds and tests after your fixes to confirm everything passes.
+- Stay inside the project directory.
+
+When all test failures are fixed, output:
+  AGENT_RESULT: DONE
+If you cannot fix a failure, output:
+  AGENT_RESULT: FAILED
+  REASON: <brief explanation>
+""".strip()
+
+REFACTOR_TEST_FIX_PROMPT = """
+You are a senior code reviewer fixing test failures introduced during refactoring.
+
+STEP:
+{step_json}
+
+PROJECT DIR: {project_dir}
+
+TEST FAILURES TO FIX:
+{test_failures}
+
+INSTRUCTIONS:
+- Your previous refactoring broke tests. Fix the issues without reverting to
+  pre-refactored code — keep the improved structure where possible.
+- Do NOT add features or change logic beyond what is needed to fix the failures.
+- Run tests after your fixes to confirm everything passes.
+
+When all test failures are fixed, output:
+  AGENT_RESULT: DONE
+If you cannot fix the failures, output:
+  AGENT_RESULT: FAILED
+  REASON: <brief explanation>
+""".strip()
+
+DEV_SECURITY_FIX_PROMPT = """
+You are a senior developer fixing security issues found by a security review.
+
+STEP:
+{step_json}
+
+PROJECT DIR: {project_dir}
+
+ENVIRONMENT:
+{env_summary}
+
+PRODUCTION COMPONENTS ALREADY INSTALLED (do not add to these):
+{production_components}
+
+SECURITY ISSUES TO FIX:
+{security_issues}
+
+INSTRUCTIONS:
+- Fix EVERY security issue listed above. Do not skip any.
+- Do not change functionality or public interfaces — only fix the security problems.
+- Run builds and tests after your fixes to confirm nothing broke.
+- Stay inside the project directory.
+
+When all security issues are fixed, output:
+  AGENT_RESULT: DONE
+If you cannot fix an issue, output:
+  AGENT_RESULT: FAILED
+  REASON: <brief explanation>
+""".strip()
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -288,7 +372,7 @@ def parse_result(output: str) -> str:
 # Agent runners
 # ---------------------------------------------------------------------------
 
-def run_dev(step: dict, project_dir: str, env_summary: str, production_components: str) -> bool:
+def run_dev(step: dict, project_dir: str, env_summary: str, production_components: str) -> tuple[bool, str]:
     prompt = DEV_PROMPT.format(
         step_json=json.dumps(step, indent=2),
         project_dir=project_dir,
@@ -298,10 +382,53 @@ def run_dev(step: dict, project_dir: str, env_summary: str, production_component
     output = run_claude(prompt, step["step"], "dev", project_dir)
     result = parse_result(output)
     log.info(f"  [dev] -> {result}")
-    return result == "DONE"
+    return result == "DONE", output
 
 
-def run_test(step: dict, project_dir: str) -> bool:
+def run_dev_test_fix(step: dict, project_dir: str, env_summary: str,
+                     production_components: str, test_failures: str) -> tuple[bool, str]:
+    prompt = DEV_TEST_FIX_PROMPT.format(
+        step_json=json.dumps(step, indent=2),
+        project_dir=project_dir,
+        env_summary=env_summary,
+        production_components=production_components,
+        test_failures=test_failures,
+    )
+    output = run_claude(prompt, step["step"], "dev", project_dir)
+    result = parse_result(output)
+    log.info(f"  [dev/test-fix] -> {result}")
+    return result == "DONE", output
+
+
+def run_dev_security_fix(step: dict, project_dir: str, env_summary: str,
+                         production_components: str, security_issues: str) -> tuple[bool, str]:
+    prompt = DEV_SECURITY_FIX_PROMPT.format(
+        step_json=json.dumps(step, indent=2),
+        project_dir=project_dir,
+        env_summary=env_summary,
+        production_components=production_components,
+        security_issues=security_issues,
+    )
+    output = run_claude(prompt, step["step"], "dev", project_dir)
+    result = parse_result(output)
+    log.info(f"  [dev/security-fix] -> {result}")
+    return result == "DONE", output
+
+
+def run_refactor_test_fix(step: dict, project_dir: str,
+                          test_failures: str) -> tuple[bool, str]:
+    prompt = REFACTOR_TEST_FIX_PROMPT.format(
+        step_json=json.dumps(step, indent=2),
+        project_dir=project_dir,
+        test_failures=test_failures,
+    )
+    output = run_claude(prompt, step["step"], "refactor", project_dir)
+    result = parse_result(output)
+    log.info(f"  [refactor/test-fix] -> {result}")
+    return result == "DONE", output
+
+
+def run_test(step: dict, project_dir: str) -> tuple[bool, str]:
     prompt = TEST_PROMPT.format(
         step_json=json.dumps(step, indent=2),
         project_dir=project_dir,
@@ -309,10 +436,10 @@ def run_test(step: dict, project_dir: str) -> bool:
     output = run_claude(prompt, step["step"], "test", project_dir)
     result = parse_result(output)
     log.info(f"  [test] -> {result}")
-    return result == "PASS"
+    return result == "PASS", output
 
 
-def run_refactor(step: dict, project_dir: str) -> bool:
+def run_refactor(step: dict, project_dir: str) -> tuple[bool, str]:
     prompt = REFACTOR_PROMPT.format(
         step_json=json.dumps(step, indent=2),
         project_dir=project_dir,
@@ -320,10 +447,10 @@ def run_refactor(step: dict, project_dir: str) -> bool:
     output = run_claude(prompt, step["step"], "refactor", project_dir)
     result = parse_result(output)
     log.info(f"  [refactor] -> {result}")
-    return result == "DONE"
+    return result == "DONE", output
 
 
-def run_security(step: dict, project_dir: str, production_components: str) -> bool:
+def run_security(step: dict, project_dir: str, production_components: str) -> tuple[bool, str]:
     prompt = SECURITY_PROMPT.format(
         step_json=json.dumps(step, indent=2),
         project_dir=project_dir,
@@ -332,7 +459,7 @@ def run_security(step: dict, project_dir: str, production_components: str) -> bo
     output = run_claude(prompt, step["step"], "security", project_dir)
     result = parse_result(output)
     log.info(f"  [security] -> {result}")
-    return result == "PASS"
+    return result == "PASS", output
 
 # ---------------------------------------------------------------------------
 # Step pipeline
@@ -357,17 +484,24 @@ def run_step(step: dict, project_dir: str, env_summary: str, production_componen
     # --- Dev + Test loop ---
     log.info(f"\n  [dev loop]")
     dev_passed = False
+    last_test_output = ""
     for attempt in range(1, MAX_DEV_RETRIES + 1):
         log.info(f"  attempt {attempt}/{MAX_DEV_RETRIES}")
-        if not run_dev(step, project_dir, env_summary, production_components):
+        if attempt == 1:
+            dev_ok, _ = run_dev(step, project_dir, env_summary, production_components)
+        else:
+            dev_ok, _ = run_dev_test_fix(step, project_dir, env_summary,
+                                         production_components, last_test_output)
+        if not dev_ok:
             log.warning(f"  [dev] FAILED on attempt {attempt}")
         else:
-            if run_test(step, project_dir):
+            test_ok, last_test_output = run_test(step, project_dir)
+            if test_ok:
                 log.info(f"  [test] PASS — dev loop done")
                 dev_passed = True
                 break
             else:
-                log.warning(f"  [test] FAIL — retrying dev")
+                log.warning(f"  [test] FAIL — retrying dev with failure details")
         if attempt == MAX_DEV_RETRIES:
             log.error(f"  [dev loop] exhausted {MAX_DEV_RETRIES} attempts — STEP FAILED")
             return False
@@ -379,10 +513,12 @@ def run_step(step: dict, project_dir: str, env_summary: str, production_componen
     # --- Refactor + Test loop ---
     log.info(f"\n  [refactor loop]")
     for attempt in range(1, MAX_REF_RETRIES + 1):
-        if not run_refactor(step, project_dir):
+        ref_ok, _ = run_refactor(step, project_dir)
+        if not ref_ok:
             log.warning(f"  [refactor] FAILED attempt {attempt} — skipping refactor")
             break
-        if run_test(step, project_dir):
+        test_ok, test_output = run_test(step, project_dir)
+        if test_ok:
             log.info(f"  [test] PASS after refactor")
             break
         else:
@@ -390,17 +526,28 @@ def run_step(step: dict, project_dir: str, env_summary: str, production_componen
             if attempt == MAX_REF_RETRIES:
                 log.error(f"  [refactor] broke tests — STEP FAILED")
                 return False
+            fix_ok, _ = run_refactor_test_fix(step, project_dir, test_output)
+            if not fix_ok:
+                log.error(f"  [refactor/test-fix] could not fix — STEP FAILED")
+                return False
             time.sleep(3)
 
     # --- Security ---
     log.info(f"\n  [security review]")
-    if not run_security(step, project_dir, production_components):
+    sec_ok, sec_output = run_security(step, project_dir, production_components)
+    if not sec_ok:
         log.warning(f"  [security] issues found — running dev to fix")
-        run_dev(step, project_dir, env_summary, production_components)
-        if not run_test(step, project_dir):
+        fix_ok, _ = run_dev_security_fix(step, project_dir, env_summary,
+                                         production_components, sec_output)
+        if not fix_ok:
+            log.error(f"  [security fix] dev could not fix issues — STEP FAILED")
+            return False
+        test_ok, _ = run_test(step, project_dir)
+        if not test_ok:
             log.error(f"  [security fix] broke tests — STEP FAILED")
             return False
-        if not run_security(step, project_dir, production_components):
+        sec_ok, _ = run_security(step, project_dir, production_components)
+        if not sec_ok:
             log.error(f"  [security] unresolved issues — STEP FAILED")
             return False
 
