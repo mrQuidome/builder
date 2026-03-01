@@ -117,33 +117,51 @@ log = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def call_claude(prompt: str, label: str) -> str:
-    log.info(f"  [claude] {label}...")
+def restore_terminal():
+    """Restore terminal to sane state after a subprocess messes it up."""
     try:
-        result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", prompt],
-            capture_output=True,
-            text=True,
-            timeout=CLAUDE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        log.error(f"  [claude] timed out after {CLAUDE_TIMEOUT}s")
-        return "AGENT_RESULT: FAILED\nREASON: timeout"
-    except FileNotFoundError:
-        log.error("claude CLI not found — is it installed and on PATH?")
-        sys.exit(1)
+        subprocess.run(["stty", "sane"], stdin=open("/dev/tty"), check=False)
+    except Exception:
+        pass
 
-    output = result.stdout.strip()
 
-    # Save verbose log
+def call_claude(prompt: str, label: str) -> str:
+    slug = label.replace(" ", "_").replace("/", "_")
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%H%M%S")
-    safe_label = label.replace(" ", "_").replace("/", "_")
-    (log_dir / f"setup_{safe_label}_{ts}.log").write_text(
-        f"=== PROMPT ===\n{prompt}\n\n=== OUTPUT ===\n{output}\n\n=== STDERR ===\n{result.stderr.strip()}"
-    )
+    stdout_path = log_dir / f"setup_{slug}_{ts}_stdout.log"
+    stderr_path = log_dir / f"setup_{slug}_{ts}_stderr.log"
+    log.info(f"  [claude] {label}  stdout -> {stdout_path}")
 
+    with open(stdout_path, "w") as fout, open(stderr_path, "w") as ferr:
+        try:
+            proc = subprocess.Popen(
+                ["claude", "--print", "--dangerously-skip-permissions"],
+                stdin=subprocess.PIPE,
+                stdout=fout,
+                stderr=ferr,
+            )
+            proc.stdin.write(prompt.encode())
+            proc.stdin.close()
+            proc.wait(timeout=CLAUDE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            restore_terminal()
+            log.error(f"  [claude] timed out after {CLAUDE_TIMEOUT}s")
+            return "AGENT_RESULT: FAILED\nREASON: timeout"
+        except FileNotFoundError:
+            log.error("claude CLI not found — is it installed and on PATH?")
+            sys.exit(1)
+
+    if proc.returncode != 0:
+        restore_terminal()
+        stderr_content = Path(stderr_path).read_text().strip()
+        log.error(f"  [claude] exited {proc.returncode}: {stderr_content}")
+        return f"AGENT_RESULT: FAILED\nREASON: claude exited {proc.returncode}"
+
+    output = Path(stdout_path).read_text().strip()
     return output
 
 
