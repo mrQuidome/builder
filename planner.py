@@ -29,7 +29,7 @@ from pathlib import Path
 
 DEFAULT_PLAN    = "unwalked_build_plan.json"
 DEFAULT_CONFIG  = "setup_config.json"
-CLAUDE_TIMEOUT  = 300
+CLAUDE_TIMEOUT  = 600
 LOG_FILE        = "planner.log"
 
 # ---------------------------------------------------------------------------
@@ -165,31 +165,59 @@ log = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def call_claude(prompt: str, label: str) -> str:
-    log.info(f"Calling claude [{label}]...")
+def restore_terminal():
+    """Restore terminal to sane state after a subprocess messes it up."""
     try:
-        result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", prompt],
-            capture_output=True,
-            text=True,
-            timeout=CLAUDE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        log.error(f"Claude timed out after {CLAUDE_TIMEOUT}s")
-        sys.exit(1)
-    except FileNotFoundError:
-        log.error("claude CLI not found — is it installed and on PATH?")
-        sys.exit(1)
+        subprocess.run(["stty", "sane"], stdin=open("/dev/tty"), check=False)
+    except Exception:
+        pass
 
-    if result.returncode != 0:
-        log.warning(f"claude exited {result.returncode}: {result.stderr.strip()}")
 
-    return result.stdout.strip()
+def call_claude(prompt: str, label: str) -> str:
+    slug = label.replace(" ", "_")
+    stdout_path = f"claude_{slug}_stdout.log"
+    stderr_path = f"claude_{slug}_stderr.log"
+    log.info(f"Calling claude [{label}]  stdout -> {stdout_path}  stderr -> {stderr_path}")
+
+    with open(stdout_path, "w") as fout, open(stderr_path, "w") as ferr:
+        try:
+            proc = subprocess.Popen(
+                ["claude", "--print", "--dangerously-skip-permissions"],
+                stdin=subprocess.PIPE,
+                stdout=fout,
+                stderr=ferr,
+            )
+            proc.stdin.write(prompt.encode())
+            proc.stdin.close()
+            proc.wait(timeout=CLAUDE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            restore_terminal()
+            log.error(f"Claude timed out after {CLAUDE_TIMEOUT}s — check {stdout_path} and {stderr_path} for partial output")
+            sys.exit(1)
+        except FileNotFoundError:
+            log.error("claude CLI not found — is it installed and on PATH?")
+            sys.exit(1)
+
+    if proc.returncode != 0:
+        restore_terminal()
+        stderr_content = Path(stderr_path).read_text().strip()
+        log.warning(f"claude exited {proc.returncode}: {stderr_content}")
+
+    output = Path(stdout_path).read_text().strip()
+    return output
 
 
 def extract_json(raw: str) -> dict:
+    # Try matched opening + closing fences first
     match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", raw)
-    text = match.group(1).strip() if match else raw.strip()
+    if match:
+        text = match.group(1).strip()
+    else:
+        # Handle opening fence with no closing fence
+        match_open = re.search(r"```(?:json)?\s*\n", raw)
+        text = raw[match_open.end():].strip() if match_open else raw.strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
