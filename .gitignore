@@ -1,0 +1,14 @@
+# logs
+*.log
+logs/
+planner_raw_*.txt
+
+# state files (machine-specific)
+orchestrator_state.json
+
+# secrets - never commit these
+setup_config.json
+
+# python
+__pycache__/
+*.pyc
