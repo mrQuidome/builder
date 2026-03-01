@@ -36,7 +36,7 @@ STATE_FILE      = "orchestrator_state.json"
 LOG_FILE        = "orchestrator.log"
 MAX_DEV_RETRIES = 3
 MAX_REF_RETRIES = 2
-CLAUDE_TIMEOUT  = 600
+CLAUDE_TIMEOUT  = 1800
 
 # ---------------------------------------------------------------------------
 # Agent prompts
@@ -139,7 +139,7 @@ INSTRUCTIONS:
 - Review all code added or modified in this step.
 
 Check for security issues:
-- Hardcoded secrets, credentials, or API keys in code or config files
+- Hardcoded secrets, credentials, or API keys in SOURCE CODE files (.rs, .py, .js, etc.)
 - SQL injection or unsafe query construction
 - Missing authentication or authorisation checks
 - Unsafe unwraps on user-controlled input
@@ -151,6 +151,17 @@ Check for scope violations:
 - Any new production infrastructure introduced (databases, queues, services,
   system daemons, reverse proxies) that is NOT in the production components list
 - Any external service dependency not in the original design
+
+ACCEPTABLE PRACTICES — do NOT flag these as issues:
+- A .env file in the working directory is standard practice for local configuration.
+  As long as .env is listed in .gitignore, this is acceptable. Only flag if .env is
+  NOT in .gitignore or if secrets appear in committed source code files.
+- Semver ranges in Cargo.toml (e.g. "0.7", "1") are standard Rust practice for
+  applications. As long as Cargo.lock is present (pinning exact versions), broad
+  ranges in Cargo.toml are acceptable. Only flag if Cargo.lock is missing or gitignored.
+- .env.example files with placeholder values are acceptable and expected.
+- Auto-generated secrets placed in .env (not in source code) are acceptable.
+- Using dotenvy::dotenv().ok() (non-override) to load .env is acceptable.
 
 If you find any issues output:
   AGENT_RESULT: ISSUES_FOUND
@@ -215,8 +226,8 @@ If you cannot fix the failures, output:
   REASON: <brief explanation>
 """.strip()
 
-DEV_SECURITY_FIX_PROMPT = """
-You are a senior developer fixing security issues found by a security review.
+SECURITY_FIX_PROMPT = """
+You are a security engineer fixing security issues found during a security review.
 
 STEP:
 {step_json}
@@ -235,8 +246,10 @@ SECURITY ISSUES TO FIX:
 INSTRUCTIONS:
 - Fix EVERY security issue listed above. Do not skip any.
 - Do not change functionality or public interfaces — only fix the security problems.
+- You may fix issues in both project source code AND system configuration files
+  (e.g. /etc/nginx/, /etc/systemd/, service configs) as needed.
 - Run builds and tests after your fixes to confirm nothing broke.
-- Stay inside the project directory.
+- If a fix requires restarting a service (e.g. nginx, martin), do so.
 
 When all security issues are fixed, output:
   AGENT_RESULT: DONE
@@ -400,18 +413,18 @@ def run_dev_test_fix(step: dict, project_dir: str, env_summary: str,
     return result == "DONE", output
 
 
-def run_dev_security_fix(step: dict, project_dir: str, env_summary: str,
-                         production_components: str, security_issues: str) -> tuple[bool, str]:
-    prompt = DEV_SECURITY_FIX_PROMPT.format(
+def run_security_fix(step: dict, project_dir: str, env_summary: str,
+                     production_components: str, security_issues: str) -> tuple[bool, str]:
+    prompt = SECURITY_FIX_PROMPT.format(
         step_json=json.dumps(step, indent=2),
         project_dir=project_dir,
         env_summary=env_summary,
         production_components=production_components,
         security_issues=security_issues,
     )
-    output = run_claude(prompt, step["step"], "dev", project_dir)
+    output = run_claude(prompt, step["step"], "security-fix", project_dir)
     result = parse_result(output)
-    log.info(f"  [dev/security-fix] -> {result}")
+    log.info(f"  [security-fix] -> {result}")
     return result == "DONE", output
 
 
@@ -536,11 +549,11 @@ def run_step(step: dict, project_dir: str, env_summary: str, production_componen
     log.info(f"\n  [security review]")
     sec_ok, sec_output = run_security(step, project_dir, production_components)
     if not sec_ok:
-        log.warning(f"  [security] issues found — running dev to fix")
-        fix_ok, _ = run_dev_security_fix(step, project_dir, env_summary,
-                                         production_components, sec_output)
+        log.warning(f"  [security] issues found — running security-fix agent")
+        fix_ok, _ = run_security_fix(step, project_dir, env_summary,
+                                     production_components, sec_output)
         if not fix_ok:
-            log.error(f"  [security fix] dev could not fix issues — STEP FAILED")
+            log.error(f"  [security-fix] could not fix issues — STEP FAILED")
             return False
         test_ok, _ = run_test(step, project_dir)
         if not test_ok:
