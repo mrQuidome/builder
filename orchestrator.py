@@ -493,6 +493,20 @@ def build_production_components(config: dict) -> str:
     return "\n".join(lines) if lines else "  (none listed)"
 
 
+def _ensure_git_repo(project_dir: str):
+    """Initialise a git repo in project_dir if one doesn't exist yet."""
+    git_dir = os.path.join(project_dir, ".git")
+    if os.path.isdir(git_dir):
+        return
+    log.info(f"  [commit] no .git found – running git init in {project_dir}")
+    subprocess.run(["git", "init"], cwd=project_dir, check=True,
+                   capture_output=True, timeout=30)
+    subprocess.run(["git", "config", "user.name", "builder"],
+                   cwd=project_dir, check=True, capture_output=True, timeout=10)
+    subprocess.run(["git", "config", "user.email", "builder@localhost"],
+                   cwd=project_dir, check=True, capture_output=True, timeout=10)
+
+
 def commit_step(step: dict, project_dir: str):
     """Git add + commit all changes for the completed step."""
     n = step["step"]
@@ -501,6 +515,7 @@ def commit_step(step: dict, project_dir: str):
     log.info("")
     log.info(f"  [commit] {msg}")
     try:
+        _ensure_git_repo(project_dir)
         subprocess.run(["git", "add", "-A"], cwd=project_dir, check=True,
                        capture_output=True, timeout=60)
         result = subprocess.run(

@@ -122,6 +122,8 @@ PROJECT DIRS — create these directories if they don't exist:
 INSTRUCTIONS:
 - Append or update each variable in /etc/environment.
 - Create all project directories with appropriate permissions.
+- Run `git init` inside each project directory so they are ready for version control.
+  Set local git config: user.name "builder" and user.email "builder@localhost".
 - When done output one of these exact lines:
   AGENT_RESULT: DONE
   AGENT_RESULT: FAILED
