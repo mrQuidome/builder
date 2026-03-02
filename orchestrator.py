@@ -488,6 +488,31 @@ def build_production_components(config: dict) -> str:
     return "\n".join(lines) if lines else "  (none listed)"
 
 
+def commit_step(step: dict, project_dir: str):
+    """Git add + commit all changes for the completed step."""
+    n = step["step"]
+    title = step.get("title", "untitled")
+    msg = f"Step {n:02d}: {title}"
+    log.info(f"\n  [commit] {msg}")
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=project_dir, check=True,
+                       capture_output=True, timeout=60)
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=project_dir, capture_output=True, timeout=60,
+        )
+        if result.returncode == 0:
+            log.info(f"  [commit] nothing to commit")
+            return
+        subprocess.run(["git", "commit", "-m", msg], cwd=project_dir, check=True,
+                       capture_output=True, timeout=60)
+        log.info(f"  [commit] done")
+    except subprocess.CalledProcessError as e:
+        log.warning(f"  [commit] failed: {e}")
+    except Exception as e:
+        log.warning(f"  [commit] error: {e}")
+
+
 def run_step(step: dict, project_dir: str, env_summary: str, production_components: str) -> bool:
     n = step["step"]
     log.info(f"\n{'='*60}")
@@ -563,6 +588,9 @@ def run_step(step: dict, project_dir: str, env_summary: str, production_componen
         if not sec_ok:
             log.error(f"  [security] unresolved issues — STEP FAILED")
             return False
+
+    # --- Commit ---
+    commit_step(step, project_dir)
 
     log.info(f"\n  STEP {n:02d} COMPLETE")
     return True
