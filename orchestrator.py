@@ -259,6 +259,41 @@ If you cannot fix an issue, output:
   REASON: <brief explanation>
 """.strip()
 
+SECURITY_FIX_TEST_REPAIR_PROMPT = """
+You are a security engineer. A previous security fix broke existing tests.
+Your job is to fix ALL the security issues while keeping ALL tests passing.
+
+STEP:
+{step_json}
+
+PROJECT DIR: {project_dir}
+
+ENVIRONMENT:
+{env_summary}
+
+PRODUCTION COMPONENTS ALREADY INSTALLED (do not add to these):
+{production_components}
+
+SECURITY ISSUES TO FIX:
+{security_issues}
+
+TEST FAILURES INTRODUCED BY THE PREVIOUS SECURITY FIX:
+{test_failures}
+
+INSTRUCTIONS:
+- Fix EVERY security issue listed above. Do not skip any.
+- Resolve EVERY test failure listed above — tests must pass after your changes.
+- Do not change functionality or public interfaces beyond what is needed.
+- Run builds and tests after your changes to confirm everything passes.
+- If a fix requires restarting a service (e.g. nginx, martin), do so.
+
+When all security issues are fixed and tests pass, output:
+  AGENT_RESULT: DONE
+If you cannot resolve both the security issues and the test failures, output:
+  AGENT_RESULT: FAILED
+  REASON: <brief explanation>
+""".strip()
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -430,6 +465,23 @@ def run_security_fix(step: dict, project_dir: str, env_summary: str,
     output = run_claude(prompt, step["step"], "security-fix", project_dir)
     result = parse_result(output)
     log.info(f"  [security-fix] -> {result}")
+    return result == "DONE", output
+
+
+def run_security_fix_test_repair(step: dict, project_dir: str, env_summary: str,
+                                 production_components: str, security_issues: str,
+                                 test_failures: str) -> tuple[bool, str]:
+    prompt = SECURITY_FIX_TEST_REPAIR_PROMPT.format(
+        step_json=json.dumps(step, indent=2),
+        project_dir=project_dir,
+        env_summary=env_summary,
+        production_components=production_components,
+        security_issues=security_issues,
+        test_failures=test_failures,
+    )
+    output = run_claude(prompt, step["step"], "security-fix", project_dir)
+    result = parse_result(output)
+    log.info(f"  [security-fix/repair] -> {result}")
     return result == "DONE", output
 
 
@@ -646,10 +698,19 @@ def run_step(step: dict, project_dir: str, env_summary: str,
                 log.error(f"  [security-fix] could not fix issues — STEP FAILED")
                 return False
 
-            test_ok, _ = run_test(step, project_dir)
+            test_ok, test_output = run_test(step, project_dir)
             if not test_ok:
-                log.error(f"  [security fix] broke tests — STEP FAILED")
-                return False
+                log.warning(f"  [security fix] broke tests — attempting repair")
+                repair_ok, _ = run_security_fix_test_repair(
+                    step, project_dir, env_summary, production_components,
+                    sec_output, test_output)
+                if not repair_ok:
+                    log.error(f"  [security fix] repair agent failed — STEP FAILED")
+                    return False
+                test_ok, _ = run_test(step, project_dir)
+                if not test_ok:
+                    log.error(f"  [security fix] tests still failing after repair — STEP FAILED")
+                    return False
 
             sec_ok, sec_output = run_security(step, project_dir, production_components)
             time.sleep(3)
