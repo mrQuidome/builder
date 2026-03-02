@@ -1,0 +1,913 @@
+{
+  "status": "ok",
+  "project": "Unwalked Route Planner",
+  "steps": [
+    {
+      "step": 1,
+      "title": "Server project scaffolding",
+      "goal": "Initialize the Rust/Axum server project with configuration, database connection pool, project structure, and health check endpoint.",
+      "input": "Empty repository",
+      "tasks": [
+        "Initialize Rust project with Cargo; add axum, tokio, sqlx (PostgreSQL), serde, dotenvy dependencies",
+        "Create project directory structure: routes/, services/, models/, db/, middleware/",
+        "Implement configuration loading from environment variables (database URL, JWT secret, server bind address)",
+        "Set up PostgreSQL connection pool using sqlx",
+        "Implement GET /health endpoint returning 200 OK",
+        "Structure codebase for future i18n (error messages as constants/enums, not inline strings)"
+      ],
+      "definition_of_done": [
+        "Server compiles, starts, and responds to GET /health with 200 OK",
+        "Database connection pool connects to PostgreSQL successfully",
+        "Configuration loads from environment variables or .env file"
+      ]
+    },
+    {
+      "step": 2,
+      "title": "Database schema: users and authentication",
+      "goal": "Create the database tables for user accounts, credentials, social login links, and refresh tokens.",
+      "input": "Server scaffolding with database connection (step 1)",
+      "tasks": [
+        "Create migration: users table (id UUID PK, email unique, username, password_hash nullable, created_at, updated_at)",
+        "Create migration: social_logins table (user_id FK, provider enum Google/Apple, provider_user_id, created_at; unique on provider + provider_user_id)",
+        "Create migration: refresh_tokens table (id UUID, user_id FK, token_hash, expires_at, revoked_at nullable)",
+        "Create migration: password_reset_tokens table (id UUID, user_id FK, token_hash, expires_at, used_at nullable)",
+        "Define corresponding Rust model structs with sqlx FromRow derives"
+      ],
+      "definition_of_done": [
+        "All migrations run successfully against a clean database",
+        "Model structs compile and can be queried with sqlx",
+        "Unique constraints enforced on email and social login provider+provider_user_id"
+      ]
+    },
+    {
+      "step": 3,
+      "title": "Database schema: graph and OSM data",
+      "goal": "Create the database tables for storing the routable graph derived from OpenStreetMap, with PostGIS geometry, pgRouting topology, and edge ID stability design.",
+      "input": "Database connection (step 1)",
+      "tasks": [
+        "Enable PostGIS and pgRouting extensions in migration",
+        "Create migration: osm_regions table (id, region_key unique, bbox geometry, imported_at, osm_data_timestamp)",
+        "Create migration: nodes table (id BIGINT PK, geom geometry(Point, 4326), region_id FK)",
+        "Create migration: edges table (id BIGINT PK, stable_edge_id VARCHAR unique for cross-refresh stability, source_node BIGINT FK, target_node BIGINT FK, geom geometry(LineString, 4326), length_m DOUBLE, is_dead_end BOOLEAN, region_id FK, osm_way_id BIGINT, osm_node_pair_hash for stable ID matching)",
+        "Add spatial indexes on edges.geom and nodes.geom",
+        "Create pgRouting topology or equivalent index structure for shortest-path queries",
+        "Design and document the edge ID stability strategy (hash of sorted OSM node pair + way ID)"
+      ],
+      "definition_of_done": [
+        "PostGIS and pgRouting extensions are active",
+        "All tables created with spatial indexes",
+        "Edge ID stability strategy documented and encoded in schema",
+        "pgRouting can perform shortest-path queries on the edges table"
+      ]
+    },
+    {
+      "step": 4,
+      "title": "Database schema: walk history",
+      "goal": "Create tables for recording per-user walk sessions and per-edge walk counts.",
+      "input": "Users table (step 2), edges table (step 3)",
+      "tasks": [
+        "Create migration: walk_sessions table (id UUID PK, user_id FK, started_at, ended_at nullable, status enum active/completed/abandoned, total_distance_m DOUBLE, route_mode enum circular/a_to_b/a_to_b_shortest, planned_route_geom geometry nullable)",
+        "Create migration: edge_walk_counts table (user_id FK, edge_stable_id VARCHAR, walk_count INT default 0, last_walked_at, PK on user_id + edge_stable_id)",
+        "Add index on edge_walk_counts(user_id) for efficient per-user lookups",
+        "Define Rust model structs"
+      ],
+      "definition_of_done": [
+        "Migrations run successfully",
+        "edge_walk_counts supports efficient lookup of all edge counts for a given user",
+        "walk_sessions tracks individual walk lifecycle with status transitions"
+      ]
+    },
+    {
+      "step": 5,
+      "title": "Database schema: user preferences",
+      "goal": "Create tables for user-configurable settings and per-path preferences.",
+      "input": "Users table (step 2)",
+      "tasks": [
+        "Create migration: user_settings table (user_id FK PK, margin_percent INT default 10, shortest_path_margin_percent INT default 10, dead_ends_enabled BOOLEAN default false, circularity_weight FLOAT default 0.5)",
+        "Create migration: user_path_preferences table (user_id FK, edge_stable_id VARCHAR, preference enum prefer_not/block, created_at, PK on user_id + edge_stable_id)",
+        "Define Rust model structs"
+      ],
+      "definition_of_done": [
+        "Migrations run successfully",
+        "Settings table has sensible defaults for all fields",
+        "Path preferences support prefer_not and block per edge per user"
+      ]
+    },
+    {
+      "step": 6,
+      "title": "Database schema: subscriptions and payments",
+      "goal": "Create tables for tracking user subscription status, free tier usage, and payment audit log.",
+      "input": "Users table (step 2)",
+      "tasks": [
+        "Create migration: subscriptions table (user_id FK PK, tier enum free/paid default free, total_walked_distance_m DOUBLE default 0, free_tier_limit_m DOUBLE default 100000, subscription_start TIMESTAMP nullable, subscription_end TIMESTAMP nullable, payment_provider enum mollie/apple/google nullable, external_subscription_id VARCHAR nullable)",
+        "Create migration: payment_events table (id UUID PK, user_id FK, event_type VARCHAR, provider VARCHAR, external_id VARCHAR, amount_cents INT, currency VARCHAR, created_at)",
+        "Define Rust model structs"
+      ],
+      "definition_of_done": [
+        "Migrations run successfully",
+        "Free tier limit defaults to 100000m (100km)",
+        "Subscription and payment event records queryable per user"
+      ]
+    },
+    {
+      "step": 7,
+      "title": "OSM data ingestion pipeline",
+      "goal": "Build a pipeline that imports OpenStreetMap data into the graph tables with stable edge IDs, on-demand regional loading, and dead end detection.",
+      "input": "Graph schema with edge ID stability design (step 3)",
+      "tasks": [
+        "Implement OSM PBF file parser or integrate osm2pgsql/osm4routing for extracting walkable ways",
+        "Filter to walkable paths only (footways, paths, sidewalks, pedestrian areas, residential streets, tracks)",
+        "Generate stable edge IDs from OSM way ID + sorted node pair hash",
+        "Implement region-based import: define region boundaries, import one region at a time, record in osm_regions",
+        "Handle cross-border edges that span region boundaries",
+        "Mark dead-end edges (edges leading to nodes with degree 1)",
+        "Implement re-import that preserves stable edge IDs across OSM data refreshes",
+        "Build pgRouting topology after import"
+      ],
+      "definition_of_done": [
+        "A test region imports successfully with all walkable edges",
+        "Edge IDs remain stable across a re-import of the same region with updated OSM data",
+        "Dead-end edges are correctly identified",
+        "pgRouting shortest-path queries work on imported data",
+        "Cross-region edge continuity is maintained"
+      ]
+    },
+    {
+      "step": 8,
+      "title": "Self-hosted map tile server",
+      "goal": "Deploy a self-hosted tile server that renders map tiles from OSM data for the Flutter client.",
+      "input": "OSM data available (step 7)",
+      "tasks": [
+        "Select and configure tile server software (e.g., Martin, tileserver-gl, or OpenMapTiles)",
+        "Set up tile generation pipeline from imported OSM data",
+        "Configure tile serving with appropriate caching headers",
+        "Ensure tile coverage matches the same regions as the graph data",
+        "Configure CORS headers for web client access"
+      ],
+      "definition_of_done": [
+        "Tile server serves raster or vector tiles over HTTP",
+        "Tiles render correctly in a browser-based test map viewer",
+        "Tile coverage matches imported OSM regions",
+        "CORS allows cross-origin requests from the web client"
+      ]
+    },
+    {
+      "step": 9,
+      "title": "Authentication service: email and password",
+      "goal": "Implement user registration, login, JWT access tokens, and refresh token rotation for email/password authentication.",
+      "input": "Users and auth schema (step 2), user settings and subscription tables (steps 5-6)",
+      "tasks": [
+        "Implement password hashing with argon2",
+        "Implement registration: validate email uniqueness, hash password, create user record, initialize default user_settings and free-tier subscription records",
+        "Implement login: verify email + password, issue short-lived JWT access token and refresh token",
+        "Implement token refresh: validate refresh token, issue new access + refresh token pair, revoke old refresh token",
+        "Implement logout: revoke refresh token",
+        "Create JWT extraction and validation middleware for protecting routes"
+      ],
+      "definition_of_done": [
+        "User can register with email and password",
+        "User can log in and receive JWT access token + refresh token",
+        "JWT middleware rejects invalid and expired tokens",
+        "Refresh token rotation works and old tokens are revoked on use",
+        "Registration initializes default settings and free-tier subscription"
+      ]
+    },
+    {
+      "step": 10,
+      "title": "Authentication service: social login",
+      "goal": "Add Google OAuth2 and Apple OIDC sign-in flows to the authentication service.",
+      "input": "Auth service with JWT (step 9)",
+      "tasks": [
+        "Implement Google OAuth2 flow: receive authorization code from client, exchange for tokens, extract user info, create or link account",
+        "Implement Apple OIDC flow: validate identity token, extract user info, create or link account",
+        "Handle account linking: if email already registered, link social login to existing account",
+        "Issue same JWT + refresh token pair as email/password login",
+        "Store provider and provider_user_id in social_logins table"
+      ],
+      "definition_of_done": [
+        "User can sign in with Google and receive JWT",
+        "User can sign in with Apple and receive JWT",
+        "Social login creates a new account or links to an existing account matching the email",
+        "Subsequent social logins for the same provider user return the same account"
+      ]
+    },
+    {
+      "step": 11,
+      "title": "Account management service",
+      "goal": "Implement password reset flow and immediate account deletion with complete data purge.",
+      "input": "Auth service (steps 9-10), all user data tables (steps 2-6)",
+      "tasks": [
+        "Implement password reset request: generate token, store hash in password_reset_tokens, send reset email",
+        "Implement password reset confirmation: validate token, update password hash, mark token used",
+        "Implement account deletion: require explicit confirmation, then immediately and permanently delete all user data across all tables (user, social_logins, tokens, walk_sessions, edge_walk_counts, user_settings, user_path_preferences, subscriptions, payment_events)",
+        "Ensure deletion flow is identical for email/password and social login users",
+        "Return clear response stating deletion is immediate and permanent before executing"
+      ],
+      "definition_of_done": [
+        "Password reset flow works end-to-end (request, email, confirm, new password)",
+        "Account deletion removes all user data from every table",
+        "Deletion is immediate upon confirmation with no deferred processing",
+        "Both email/password and social login users can delete their accounts identically"
+      ]
+    },
+    {
+      "step": 12,
+      "title": "Walk history service",
+      "goal": "Implement the service layer for managing walk sessions and recording per-user per-edge walk counts.",
+      "input": "Walk history schema (step 4)",
+      "tasks": [
+        "Implement walk session creation (start walk with route mode and planned route geometry)",
+        "Implement edge walk count incrementing: given a list of walked edge stable IDs, increment counts in edge_walk_counts",
+        "Implement walk session completion (mark as completed, store total distance)",
+        "Implement walk session abandonment (manual early end, partial data preserved)",
+        "Implement query: get all edge walk counts for a user within a bounding box (for planner and heatmap)",
+        "Implement total walked distance query for a user (for free tier tracking)",
+        "Implement interrupted session recovery: accept and merge delayed partial walk data"
+      ],
+      "definition_of_done": [
+        "Walk session lifecycle works: create, update, complete, abandon",
+        "Edge walk counts increment correctly per edge per user",
+        "Walk count query returns per-edge history for a user filtered by bounding box",
+        "Total distance aggregation is accurate across all sessions"
+      ]
+    },
+    {
+      "step": 13,
+      "title": "User preferences service",
+      "goal": "Implement CRUD operations for user settings and per-path preferences with penalty calculation.",
+      "input": "User preferences schema (step 5), walk history service for max walk count (step 12)",
+      "tasks": [
+        "Implement get and update user settings (margin, shortest_path_margin, dead_ends_enabled, circularity_weight)",
+        "Implement set path preference: store prefer_not or block for a given edge_stable_id",
+        "Implement remove path preference (undo prefer_not or block)",
+        "Implement prefer_not penalty calculation: max(10, user's highest single-edge walk count in history)",
+        "Implement query: get all path preferences for a user, optionally filtered by bounding box"
+      ],
+      "definition_of_done": [
+        "Settings can be read and updated per user",
+        "Path preferences can be set, queried, and removed",
+        "Prefer_not penalty correctly uses max(10, user's maximum single-edge walk count)",
+        "Before any walk history exists, prefer_not penalty defaults to 10"
+      ]
+    },
+    {
+      "step": 14,
+      "title": "Diversity scoring engine",
+      "goal": "Implement the Fibonacci-based diversity penalty calculation for route candidate edges.",
+      "input": "Walk history service (step 12), user preferences service (step 13)",
+      "tasks": [
+        "Implement Fibonacci sequence lookup (index = times walked): 0\u21920, 1\u21921, 2\u21921, 3\u21922, 4\u21923, 5\u21925, 6\u21928, ...",
+        "Implement per-edge penalty: edge_length_m \u00d7 fibonacci(walk_count)",
+        "Apply prefer_not multiplier for edges with prefer_not preference",
+        "Exclude blocked edges entirely from candidate set",
+        "Implement total route diversity penalty as sum of all per-edge penalties",
+        "Define and implement normalization of diversity score to a standard scale for weighting against circularity"
+      ],
+      "definition_of_done": [
+        "Fibonacci mapping is correct for walk counts 0 through at least 20",
+        "Edge penalty correctly multiplies edge distance by Fibonacci of walk count",
+        "Prefer_not and block preferences are correctly applied",
+        "Diversity score is normalized to a defined scale"
+      ]
+    },
+    {
+      "step": 15,
+      "title": "Circularity scoring engine",
+      "goal": "Implement circularity scoring that measures how evenly a route spreads around its geometric center, with normalization for weighting.",
+      "input": "PostGIS geometry functions (step 3)",
+      "tasks": [
+        "Compute geometric center of all route waypoints including the start point",
+        "Measure angular distribution and radial variance of waypoints around the center",
+        "Score circularity: a perfect circle scores maximum, an out-and-back route scores near zero",
+        "Define and implement normalization of circularity score to the same scale as diversity score",
+        "Implement configurable weighting: combine circularity and diversity scores using the user's circularity_weight slider value"
+      ],
+      "definition_of_done": [
+        "A roughly circular route scores high circularity",
+        "An out-and-back route scores near zero circularity",
+        "Circularity and diversity are normalized to the same scale",
+        "The weighting slider has meaningful effect across its full range"
+      ]
+    },
+    {
+      "step": 16,
+      "title": "Route planner: circular mode",
+      "goal": "Implement circular route generation that produces loop routes optimized for diversity and circularity within the distance margin.",
+      "input": "Diversity scoring (step 14), circularity scoring (step 15), graph data (step 7)",
+      "tasks": [
+        "Implement start point snapping to nearest routable node using spatial query",
+        "Implement loop route search algorithm using pgRouting or custom graph traversal that returns to start",
+        "Optimize route for combined diversity penalty (minimize) and circularity score (maximize) using configured weights",
+        "Enforce distance constraint: total route distance within requested distance \u00b1 user's margin percentage",
+        "Return route as ordered list of edge stable IDs, GeoJSON geometry, total distance, and individual scores"
+      ],
+      "definition_of_done": [
+        "Generated route starts and ends at the same snapped point",
+        "Route total distance is within requested distance \u00b1 margin",
+        "Route prefers unwalked edges over previously walked ones",
+        "Route achieves reasonable circularity rather than degenerating to out-and-back"
+      ]
+    },
+    {
+      "step": 17,
+      "title": "Route planner: A-to-B mode",
+      "goal": "Implement point-to-point route planning with diversity scoring and distance-dependent circularity weighting.",
+      "input": "Circular route planner as reference (step 16)",
+      "tasks": [
+        "Snap both start and end points to nearest routable nodes",
+        "Implement A-to-B route search optimizing diversity penalty and circularity score",
+        "Implement circularity weight fading: reduce circularity weight as straight-line A-B distance approaches the requested walking distance",
+        "Enforce distance constraint: total route distance within requested distance \u00b1 margin",
+        "Return route as ordered list of edges, GeoJSON geometry, total distance, and scores"
+      ],
+      "definition_of_done": [
+        "Route starts at snapped A and ends at snapped B",
+        "Route distance is within requested distance \u00b1 margin",
+        "Circularity influence naturally fades when A-B straight-line distance is close to requested distance",
+        "Diversity scoring correctly penalizes previously walked edges"
+      ]
+    },
+    {
+      "step": 18,
+      "title": "Route planner: A-to-B shortest mode",
+      "goal": "Implement shortest-path routing from A to B that prefers unwalked edges within the shortest path margin.",
+      "input": "Graph data with pgRouting (step 7), diversity scoring (step 14)",
+      "tasks": [
+        "Compute reference shortest path distance between snapped A and snapped B",
+        "Search for routes within shortest_path_distance \u00d7 (1 + shortest_path_margin) that minimize diversity penalty",
+        "Apply diversity scoring to prefer unwalked edges among near-shortest alternatives",
+        "Return route with total distance, diversity score, and shortest-path reference distance"
+      ],
+      "definition_of_done": [
+        "Route goes from A to B within shortest path distance + shortest path margin",
+        "Route prefers unwalked edges when multiple near-shortest paths exist",
+        "Returns the shortest path itself when no alternatives exist within margin"
+      ]
+    },
+    {
+      "step": 19,
+      "title": "Route planner: escalation strategy",
+      "goal": "Implement the no-route-found escalation: incremental margin widening, single-turnaround fallback, and clear failure messaging.",
+      "input": "All three route modes (steps 16-18)",
+      "tasks": [
+        "Implement incremental margin widening: on failure, retry with progressively wider margin up to user's margin + 10 percentage points, hard ceiling of 100%",
+        "Determine and implement appropriate margin increment size (e.g., 5pp per retry)",
+        "Implement single-turnaround fallback: allow one segment to be doubled back, penalized as if walked twice in diversity scoring",
+        "Implement final failure response: clear message suggesting a different distance or starting point",
+        "Add metadata to route response indicating whether margin was auto-widened (and to what value) or a turnaround was used"
+      ],
+      "definition_of_done": [
+        "Planner retries with progressively wider margin before resorting to turnaround",
+        "Auto-widened margin never exceeds user's configured margin + 10pp or 100% absolute",
+        "Turnaround fallback produces a valid route with exactly one doubled segment penalized correctly",
+        "User is informed of all escalation measures via response metadata",
+        "Clear failure message returned when all escalation options exhausted"
+      ]
+    },
+    {
+      "step": 20,
+      "title": "Route planner: dead end and path preference handling",
+      "goal": "Integrate dead end avoidance and user path preference constraints into the route planner across all modes.",
+      "input": "Route planner modes (steps 16-18), user preferences (step 13), dead end flags (step 7)",
+      "tasks": [
+        "When dead_ends_enabled is false, exclude dead-end edges from the traversable graph before planning",
+        "Handle start-in-dead-end edge case: if the starting node is in a dead end, allow routing out of the dead end, then apply dead end exclusion for the remainder",
+        "Apply blocked path preferences: fully exclude edges the user has blocked",
+        "Apply prefer_not penalty: use the calculated prefer_not multiplier in diversity scoring",
+        "Ensure all constraints integrate correctly with escalation strategy (step 19)"
+      ],
+      "definition_of_done": [
+        "Dead-end edges are excluded from routes when the setting is off",
+        "Starting from within a dead end correctly routes out before applying the constraint",
+        "Blocked paths never appear in generated routes",
+        "Prefer_not paths are used only when all alternatives are worse",
+        "Constraints work correctly across all three route modes and with escalation"
+      ]
+    },
+    {
+      "step": 21,
+      "title": "Walk tracking service",
+      "goal": "Implement server-side GPS trace processing, map-matching to graph edges, distance calculation, and walk completion detection.",
+      "input": "Walk history service (step 12), graph data (step 7)",
+      "tasks": [
+        "Implement GPS trace ingestion: accept ordered GPS points with timestamps",
+        "Implement map-matching: snap GPS trace points to nearest graph edges, produce ordered list of walked edge stable IDs",
+        "Calculate walked distance from matched edges",
+        "Implement walk completion detection: check if latest position is within GPS accuracy distance of start point (circular) or end point (A-to-B modes)",
+        "Implement incremental trace processing: accept and process batches of new GPS points for an active walk session",
+        "Implement interrupted session handling: accept delayed bulk uploads and merge into existing session",
+        "Update edge_walk_counts and total_walked_distance via walk history service after processing"
+      ],
+      "definition_of_done": [
+        "GPS trace is correctly map-matched to graph edges",
+        "Edge walk counts update based on matched edges",
+        "Walk completion auto-detects based on proximity to the relevant endpoint",
+        "Incremental and interrupted trace uploads process and merge correctly",
+        "Total walked distance accumulates accurately in subscription record"
+      ]
+    },
+    {
+      "step": 22,
+      "title": "Subscription and free tier service",
+      "goal": "Implement free tier enforcement, subscription lifecycle management, and payment provider integration.",
+      "input": "Subscription schema (step 6), walk tracking for distance accumulation (step 21)",
+      "tasks": [
+        "Implement free tier check: reject new route planning requests when user's total_walked_distance_m >= 100000",
+        "Allow an in-progress walk to continue and complete even after the limit is crossed mid-walk",
+        "Implement Mollie payment integration for web subscriptions (\u20ac10/year): create payment, handle webhook, activate subscription",
+        "Implement Apple IAP server-side receipt verification: validate receipt, activate subscription",
+        "Implement Google Play Billing server-side verification: validate purchase token, activate subscription",
+        "Implement subscription status query: return active/expired/free with remaining free distance",
+        "Handle subscription expiry: revert to free tier rules",
+        "Log all payment events to payment_events table"
+      ],
+      "definition_of_done": [
+        "Free tier blocks new route planning at 100km total walked",
+        "Active walk is not interrupted when crossing the free tier limit",
+        "Subscription activates after verified payment from any provider",
+        "Expired subscription correctly reverts to free tier enforcement",
+        "Payment events are logged for audit"
+      ]
+    },
+    {
+      "step": 23,
+      "title": "Rate limiting middleware",
+      "goal": "Implement per-user rate limiting on planning requests with increasing wait times for repeated rapid requests.",
+      "input": "Server scaffolding with middleware support (step 1), JWT auth middleware (step 9)",
+      "tasks": [
+        "Implement rate limiter tracking planning requests per authenticated user per time window",
+        "Apply increasing backoff: each rapid successive request requires a longer wait",
+        "Return HTTP 429 with Retry-After header when rate limited",
+        "Scope rate limiting to planning endpoint only, leaving other endpoints unaffected"
+      ],
+      "definition_of_done": [
+        "Rapid repeated planning requests from the same user are throttled",
+        "Wait time increases with repeated violations within the window",
+        "Rate limit response includes Retry-After information",
+        "Non-planning endpoints are not affected by rate limiting"
+      ]
+    },
+    {
+      "step": 24,
+      "title": "Authentication API endpoints",
+      "goal": "Expose all authentication and account management operations as REST API endpoints.",
+      "input": "Auth and account management services (steps 9-11)",
+      "tasks": [
+        "POST /api/auth/register \u2014 email, password, username; returns JWT + refresh token",
+        "POST /api/auth/login \u2014 email, password; returns JWT + refresh token",
+        "POST /api/auth/refresh \u2014 refresh token; returns new JWT + refresh token",
+        "POST /api/auth/logout \u2014 revokes refresh token",
+        "POST /api/auth/social/google \u2014 Google authorization code; returns JWT + refresh token",
+        "POST /api/auth/social/apple \u2014 Apple identity token; returns JWT + refresh token",
+        "POST /api/auth/password-reset/request \u2014 email; sends reset email",
+        "POST /api/auth/password-reset/confirm \u2014 token, new password; resets password",
+        "DELETE /api/auth/account \u2014 requires confirmation body; deletes all user data immediately",
+        "Add input validation with clear error messages for all endpoints"
+      ],
+      "definition_of_done": [
+        "All endpoints return appropriate HTTP status codes and JSON responses",
+        "Input validation rejects malformed requests with descriptive errors",
+        "Protected endpoints require valid JWT in Authorization header",
+        "Account deletion requires explicit confirmation field in request body"
+      ]
+    },
+    {
+      "step": 25,
+      "title": "Route planning API endpoints",
+      "goal": "Expose route planning, re-planning, and point snapping as REST API endpoints with subscription and rate limit enforcement.",
+      "input": "Route planner with all modes and escalation (steps 16-20), rate limiting (step 23), subscription service (step 22)",
+      "tasks": [
+        "POST /api/routes/plan \u2014 mode, distance_km, start_point, end_point (optional); returns route GeoJSON, total distance, scores, escalation metadata",
+        "POST /api/routes/snap \u2014 point coordinates; returns nearest routable point snapped to graph",
+        "Check subscription status before planning; return 402 with upgrade message if free tier exceeded",
+        "Apply rate limiting middleware to planning endpoint",
+        "Return route as GeoJSON LineString with ordered edge list, total distance, diversity score, circularity score, and escalation info",
+        "Return clear error response when server cannot produce a route after full escalation"
+      ],
+      "definition_of_done": [
+        "Planning endpoint accepts all three modes and returns valid route responses",
+        "Snap endpoint returns the nearest routable point",
+        "Free tier exceeded returns HTTP 402 with clear upgrade message",
+        "Rate-limited requests return HTTP 429 with Retry-After",
+        "Response includes escalation metadata when margin was widened or turnaround was used"
+      ]
+    },
+    {
+      "step": 26,
+      "title": "Walk tracking API endpoints",
+      "goal": "Expose walk lifecycle operations and edge walk count queries as REST API endpoints.",
+      "input": "Walk tracking service (step 21), walk history service (step 12)",
+      "tasks": [
+        "POST /api/walks/start \u2014 walk session ID or route reference, mode; returns walk session ID",
+        "POST /api/walks/{id}/sync \u2014 array of GPS points; returns updated distance, matched edges, completion status",
+        "POST /api/walks/{id}/end \u2014 manual end of walk; marks session completed or abandoned with confirmation",
+        "POST /api/walks/{id}/resume \u2014 GPS points from interrupted session; merges into existing walk data",
+        "GET /api/walks/{id} \u2014 returns walk session details, progress, and status",
+        "GET /api/walks/edge-counts \u2014 bounds query parameter (bbox); returns per-edge walk counts within viewport for heatmap rendering"
+      ],
+      "definition_of_done": [
+        "Walk can be started, synced incrementally, and ended via API",
+        "GPS trace sync returns updated distance and auto-completion status",
+        "Interrupted session data can be uploaded and merged after delay",
+        "Edge count query returns walk counts within a bounding box for heatmap"
+      ]
+    },
+    {
+      "step": 27,
+      "title": "User preferences and profile API endpoints",
+      "goal": "Expose user settings, per-path preferences, and profile information as REST API endpoints.",
+      "input": "User preferences service (step 13), subscription service (step 22)",
+      "tasks": [
+        "GET /api/user/settings \u2014 returns all current user settings",
+        "PUT /api/user/settings \u2014 update margin, shortest_path_margin, dead_ends_enabled, circularity_weight; returns updated settings",
+        "PUT /api/user/path-preferences \u2014 edge_stable_id, preference (prefer_not or block); sets or updates preference",
+        "DELETE /api/user/path-preferences/{edge_stable_id} \u2014 removes preference",
+        "GET /api/user/path-preferences \u2014 optional bounds query parameter (bbox); returns preferences within viewport",
+        "GET /api/user/profile \u2014 returns username, subscription tier, subscription dates, remaining free tier distance",
+        "Restrict circularity_weight updates to the developer account only; reject with 403 for other users"
+      ],
+      "definition_of_done": [
+        "Settings endpoints read and update all user-configurable options",
+        "Path preferences can be set, queried by viewport bounds, and removed",
+        "Profile endpoint returns subscription status and calculated remaining free tier distance",
+        "Circularity weight update rejected with 403 for non-developer accounts"
+      ]
+    },
+    {
+      "step": 28,
+      "title": "Flutter project scaffolding",
+      "goal": "Initialize the Flutter project with app shell, navigation, theming, API client with JWT auth, and i18n-ready architecture.",
+      "input": "Server API available (steps 24-27)",
+      "tasks": [
+        "Create Flutter project targeting iOS, Android, and web platforms",
+        "Set up navigation with two primary modes: planning mode and walking mode, with explicit mode switching",
+        "Implement app theming with a consistent design system",
+        "Structure all user-facing strings for i18n readiness (extractable, not inline)",
+        "Set up HTTP client for server API communication with automatic JWT injection in Authorization header",
+        "Implement secure token storage for access and refresh tokens (platform-appropriate secure storage)",
+        "Implement automatic token refresh on 401 responses",
+        "Set up state management approach (e.g., Riverpod, Bloc, or Provider)"
+      ],
+      "definition_of_done": [
+        "App builds and runs on iOS, Android, and web",
+        "Navigation between planning and walking modes works with explicit switching",
+        "API client makes authenticated requests with JWT and auto-refreshes expired tokens",
+        "All user-facing strings are in an i18n-ready structure"
+      ]
+    },
+    {
+      "step": 29,
+      "title": "Flutter: map widget and controls",
+      "goal": "Integrate the self-hosted tile server into a map widget with standard navigation controls and GPS position display.",
+      "input": "Flutter scaffolding (step 28), tile server running (step 8)",
+      "tasks": [
+        "Integrate a map library (e.g., flutter_map) configured to load tiles from the self-hosted tile server URL",
+        "Implement free pan and zoom gestures",
+        "Implement north reset button that reorients the map to north-up",
+        "Implement center-on-position button that re-centers the map on current GPS position",
+        "Display blue dot for current GPS position when GPS is available",
+        "Handle GPS unavailable gracefully: no blue dot shown, all other map controls remain functional",
+        "Ensure map renders and interacts correctly on iOS, Android, and web"
+      ],
+      "definition_of_done": [
+        "Map renders tiles from the self-hosted tile server",
+        "Pan, zoom, north reset, and center-on-position all function correctly",
+        "Blue dot appears at current GPS position when permission granted and GPS available",
+        "Map works fully without GPS except for blue dot and center-on-position"
+      ]
+    },
+    {
+      "step": 30,
+      "title": "Flutter: authentication screens",
+      "goal": "Build login, registration, social login, and password reset screens connected to the auth API.",
+      "input": "Flutter scaffolding with API client (step 28), auth API endpoints (step 24)",
+      "tasks": [
+        "Build registration screen with email, password, and username fields; input validation; submit to API",
+        "Build login screen with email and password fields; submit to API; store tokens on success",
+        "Integrate Google Sign-In SDK; send authorization code to server social login endpoint",
+        "Integrate Sign in with Apple SDK; send identity token to server social login endpoint",
+        "Build password reset request screen (enter email, submit to API)",
+        "Build password reset confirmation screen (new password entry, activated via deep link with token)",
+        "Display clear error messages for all auth failure cases",
+        "On successful login: store tokens, navigate to main app; on logout: clear tokens, navigate to login"
+      ],
+      "definition_of_done": [
+        "User can register, log in, and log out with email and password",
+        "User can sign in with Google and Apple social login",
+        "Password reset flow works from request through email to new password confirmation",
+        "Auth state persists across app restarts via stored tokens"
+      ]
+    },
+    {
+      "step": 31,
+      "title": "Flutter: onboarding flow",
+      "goal": "Implement first-run onboarding that explains GPS usage and requests permission, with graceful degradation if denied.",
+      "input": "Flutter scaffolding (step 28), map widget (step 29)",
+      "tasks": [
+        "Detect first-run state (no previous launch recorded)",
+        "Display onboarding screen explaining why GPS permission is needed (walk tracking and current position)",
+        "Request GPS/location permission via platform APIs",
+        "If permission denied: proceed to main app with degraded mode (no blue dot, no GPS-based start point, walk tracking unavailable)",
+        "Persist first-run completion so onboarding is not shown again"
+      ],
+      "definition_of_done": [
+        "First launch shows onboarding before the main app",
+        "GPS permission request includes clear explanation of purpose",
+        "App remains fully functional for planning and map viewing without GPS",
+        "Onboarding does not repeat on subsequent launches"
+      ]
+    },
+    {
+      "step": 32,
+      "title": "Flutter: planning mode UI",
+      "goal": "Build the planning mode interface with route mode selection, distance input, start/end point selection, margin display, and route request submission.",
+      "input": "Map widget (step 29), route planning API (step 25), auth state (step 30)",
+      "tasks": [
+        "Build route mode selector: circular, A-to-B, A-to-B shortest",
+        "Build distance input control (kilometers)",
+        "Implement start point selection: use current GPS position if available, or allow tap on map; call snap API to snap to nearest routable point",
+        "Implement end point selection for A-to-B modes: tap on map, snap to nearest routable point via API",
+        "Display current margin and shortest path margin values as contextual information",
+        "Display remaining free tier distance when on free tier",
+        "Submit planning request to server; display returned route as a line on the map",
+        "Handle server unreachable: show clear error message, planning not possible",
+        "Display escalation info from server response (auto-widened margin, turnaround used, no route found with suggestions)"
+      ],
+      "definition_of_done": [
+        "User can select mode, enter distance, and pick start point (and end point for A-to-B modes)",
+        "Selected points snap to nearest routable path via API",
+        "Planned route displays on the map after successful server response",
+        "Margin values and free tier remaining are visible during planning",
+        "Server errors and no-route-found results display clearly to the user"
+      ]
+    },
+    {
+      "step": 33,
+      "title": "Flutter: history heatmap layer",
+      "goal": "Implement the walk history heatmap overlay for planning mode, showing per-edge walk counts with a color scale legend.",
+      "input": "Map widget (step 29), edge count API (step 26)",
+      "tasks": [
+        "Fetch per-edge walk counts for the visible map viewport from the server edge-counts API",
+        "Render walked edges on the map colored by walk count using a heatmap color scale",
+        "Add a visual legend explaining the color scale",
+        "Display heatmap layer only in planning mode; hide it when switching to walking mode",
+        "Handle empty walk history: show a snackbar or overlay explaining what the heatmap will show once the user has walked",
+        "Optimize for performance: load edge data by viewport, debounce on pan/zoom"
+      ],
+      "definition_of_done": [
+        "Edges are colored by walk count in planning mode with correct heatmap coloring",
+        "Legend accurately explains the color scale",
+        "Heatmap layer is not visible in walking mode",
+        "Empty state shows explanatory message for users with no walk history",
+        "Rendering performs acceptably with many edges in the viewport"
+      ]
+    },
+    {
+      "step": 34,
+      "title": "Flutter: walking mode UI",
+      "goal": "Build the walking mode interface with route visualization, walked/unwalked coloring, off-route vibration, walk completion, and manual end.",
+      "input": "Map widget (step 29), walk tracking API (step 26)",
+      "tasks": [
+        "Display the full planned route on the map as a polyline",
+        "Color the already-walked portion in a distinct color and the unwalked portion ahead in another",
+        "Implement off-route detection: compare current GPS position to route, vibrate device once per minute when off-route (threshold: GPS accuracy \u00d7 2)",
+        "Implement walk completion detection: trigger when user is within GPS accuracy of start point (circular) or end point (A-to-B)",
+        "For A-to-B modes: provide manual end walk button if auto-completion doesn't trigger",
+        "Implement manual early end at any time: show confirmation dialog, then end walk and preserve walked data",
+        "Ensure explicit mode switch required to enter/exit walking mode",
+        "No turn-by-turn navigation: display route line only"
+      ],
+      "definition_of_done": [
+        "Full planned route is visible with distinct colors for walked and unwalked portions",
+        "Off-route vibration triggers once per minute when the user deviates beyond threshold",
+        "Walk auto-completes when user arrives at the endpoint within GPS accuracy",
+        "Manual end walk works with confirmation and preserves all walked data",
+        "Mode switching between planning and walking is explicit"
+      ]
+    },
+    {
+      "step": 35,
+      "title": "Flutter: background walk tracking",
+      "goal": "Implement continuous GPS trace recording including background operation, local persistence, and server synchronization.",
+      "input": "Walking mode UI (step 34), walk tracking API (step 26)",
+      "tasks": [
+        "Implement continuous GPS position recording during an active walk including when the app is backgrounded",
+        "Store GPS trace data locally on the device as it is recorded",
+        "Implement periodic batch sync of GPS trace to the server walk sync API",
+        "Handle app interruption (crash, force close, GPS loss): save trace locally, upload via resume API when app is reopened",
+        "Track every meter walked toward walk history and free tier distance",
+        "Disable walk tracking entirely on web platform; web supports planning and map viewing only",
+        "Handle GPS becoming unavailable during a walk: hide blue dot, continue recording if GPS resumes"
+      ],
+      "definition_of_done": [
+        "GPS trace records continuously including when app is in background",
+        "Trace data persists locally even if the app crashes or is force-closed",
+        "Locally stored traces upload successfully when the app is next opened",
+        "Walk tracking is disabled on web platform with no walk-related UI",
+        "Every walked meter is counted toward history and free tier usage"
+      ]
+    },
+    {
+      "step": 36,
+      "title": "Flutter: mid-walk re-planning",
+      "goal": "Enable the user to re-plan a route during an active walk from their current position with fresh parameters.",
+      "input": "Walking mode (step 34), planning mode UI (step 32), walk tracking (step 35)",
+      "tasks": [
+        "Add a re-plan action accessible during an active walk",
+        "On re-plan: preserve the already-walked portion in history (synced to server)",
+        "Present the planning UI with fresh inputs: mode selection, distance input, end point selection for A-to-B modes",
+        "New route plans from the current GPS position as the start point",
+        "All three route modes are available for re-planning",
+        "Distance is entered fresh; no suggestion or auto-fill based on what was already walked",
+        "After new route is returned, walking mode resumes with the new route"
+      ],
+      "definition_of_done": [
+        "User can initiate re-planning at any point during a walk",
+        "Previously walked portion remains recorded in history",
+        "New route starts from current position with fresh mode and distance inputs",
+        "All three route modes work for re-planning",
+        "Walking mode continues with the new route after re-planning"
+      ]
+    },
+    {
+      "step": 37,
+      "title": "Flutter: user path preferences dialog",
+      "goal": "Build the map-based dialog for setting and removing prefer-not and block preferences on individual paths.",
+      "input": "Map widget (step 29), path preferences API (step 27)",
+      "tasks": [
+        "Create a dedicated map dialog screen accessible from settings as a global option (outside planning mode)",
+        "Implement tap-on-path interaction: identify the tapped edge and show preference options",
+        "Show options on tap: set prefer not, set block, or remove existing preference",
+        "Visually distinguish paths with preferences on the map (distinct styling for prefer-not vs blocked)",
+        "Fetch and display existing path preferences within the visible viewport from the API",
+        "Sync preference changes to the server immediately",
+        "Both prefer-not and block can be undone from the same dialog interface"
+      ],
+      "definition_of_done": [
+        "User can tap paths on the map to set prefer-not or block preferences",
+        "Existing preferences are visually distinct on the map",
+        "Preferences can be removed by tapping the same path",
+        "Changes persist to the server and affect future route planning"
+      ]
+    },
+    {
+      "step": 38,
+      "title": "Flutter: settings screen",
+      "goal": "Build the settings screen with margin controls, shortest path margin, dead ends toggle, and developer-only circularity slider.",
+      "input": "User settings API (step 27), auth state for developer detection (step 30)",
+      "tasks": [
+        "Build settings screen accessible from main navigation",
+        "Add margin control (0\u2013100%) for circular and A-to-B route distance tolerance",
+        "Add shortest path margin control (0\u2013100%) for A-to-B shortest route tolerance",
+        "Add dead ends toggle (default: off \u2014 dead ends avoided)",
+        "Add circularity/diversity weighting slider: visible only when logged in as the developer account",
+        "Persist all changes to the server via the settings API",
+        "Add navigation link to the path preferences map dialog (step 37)"
+      ],
+      "definition_of_done": [
+        "All settings display current server-synced values and save changes on modification",
+        "Margin and shortest path margin accept values from 0 to 100%",
+        "Dead ends toggle defaults to off",
+        "Circularity slider is hidden for all non-developer accounts",
+        "Settings persist across sessions via server synchronization"
+      ]
+    },
+    {
+      "step": 39,
+      "title": "Flutter: profile and account screen",
+      "goal": "Build the profile screen displaying username, subscription status, and account deletion with immediate permanent deletion confirmation.",
+      "input": "Profile API (step 27), auth state (step 30), account deletion API (step 24)",
+      "tasks": [
+        "Display username",
+        "Display current payment status and subscription tier (free/paid) with dates if applicable",
+        "Provide subscription management access (link to manage or cancel subscription)",
+        "Implement account deletion flow: confirmation step with clear message that deletion is immediate and permanent, removes all data including walk history, preferences, and payment status",
+        "On confirmed deletion: call DELETE /api/auth/account, then clear local state, log out, and navigate to login screen",
+        "Ensure identical deletion flow for email/password and social login users"
+      ],
+      "definition_of_done": [
+        "Profile displays username and correct subscription status",
+        "Subscription management is accessible from the profile",
+        "Account deletion confirmation clearly states immediacy and permanence",
+        "Successful deletion clears all local data and returns to login",
+        "Deletion flow works identically for all account types"
+      ]
+    },
+    {
+      "step": 40,
+      "title": "Flutter: payment and upgrade flow",
+      "goal": "Implement the freemium upgrade prompt and payment integration with Mollie (web), Apple IAP (iOS), and Google Play Billing (Android).",
+      "input": "Subscription API (step 27), subscription service (step 22)",
+      "tasks": [
+        "When user opens planning mode and free tier is exceeded: show upgrade prompt instead of planning UI",
+        "Implement Mollie payment flow for web platform (\u20ac10/year subscription)",
+        "Implement Apple In-App Purchase flow for iOS (\u20ac10/year subscription)",
+        "Implement Google Play Billing flow for Android (\u20ac10/year subscription)",
+        "After successful payment: refresh subscription status from server, unlock planning mode",
+        "Display remaining free tier distance in planning mode for free tier users"
+      ],
+      "definition_of_done": [
+        "Free tier exceeded correctly triggers upgrade prompt when entering planning mode",
+        "Payment completes successfully on web (Mollie), iOS (Apple IAP), and Android (Google Play)",
+        "Subscription activates after payment and planning is immediately unlocked",
+        "Remaining free tier distance is visible during planning for free tier users"
+      ]
+    },
+    {
+      "step": 41,
+      "title": "Server unit and integration tests",
+      "goal": "Implement comprehensive unit tests for scoring engines and services, and integration tests for all API endpoints.",
+      "input": "All server services and API endpoints complete (steps 1-27)",
+      "tasks": [
+        "Unit tests for Fibonacci penalty calculation with edge cases (0 walks, high walk counts)",
+        "Unit tests for diversity scoring engine (penalty aggregation, normalization, prefer_not/block handling)",
+        "Unit tests for circularity scoring engine (perfect circle, out-and-back, irregular routes, normalization)",
+        "Unit tests for each route planner mode (circular, A-to-B, A-to-B shortest) with mock graph data",
+        "Unit tests for escalation strategy (margin widening bounds, turnaround penalty, exhaustion)",
+        "Unit tests for auth service (registration validation, password hashing, token lifecycle, social login linking, account deletion completeness)",
+        "Unit tests for walk tracking map-matching and distance calculation",
+        "Unit tests for subscription enforcement (free tier boundary, mid-walk crossing, expiry)",
+        "Integration tests for all API endpoints with a test database",
+        "Test edge ID stability: simulate OSM data refresh and verify IDs are preserved"
+      ],
+      "definition_of_done": [
+        "All unit tests pass",
+        "All integration tests pass with test database",
+        "Scoring algorithms have coverage for boundary conditions and edge cases",
+        "Auth flows tested including social login linking and complete account data deletion",
+        "Free tier enforcement tested at exact boundary (99.99km, 100km, 100.01km)"
+      ]
+    },
+    {
+      "step": 42,
+      "title": "Flutter widget and integration tests",
+      "goal": "Implement widget tests for all screens and integration tests for critical user flows.",
+      "input": "All Flutter screens and flows complete (steps 28-40)",
+      "tasks": [
+        "Widget tests for authentication screens (registration validation, login, social login buttons, password reset)",
+        "Widget tests for planning mode UI (mode selection, distance input, point selection, error display)",
+        "Widget tests for walking mode UI (route display, walk controls, confirmation dialogs)",
+        "Widget tests for settings screen (all controls, developer-only slider visibility)",
+        "Widget tests for profile screen (subscription display, deletion confirmation)",
+        "Integration tests for full auth flow (register, login, logout)",
+        "Integration tests for plan-and-walk flow (select mode, plan route, start walk, complete)",
+        "Integration tests for re-planning during active walk",
+        "Verify web platform correctly omits walk tracking functionality"
+      ],
+      "definition_of_done": [
+        "All widget tests pass for every screen",
+        "Integration tests pass for auth, planning, and walking flows",
+        "Web platform integration test confirms walk tracking is absent",
+        "Critical user flow coverage ensures no regressions"
+      ]
+    },
+    {
+      "step": 43,
+      "title": "End-to-end system tests",
+      "goal": "Validate complete user journeys spanning the Flutter client and Rust server together.",
+      "input": "All server and client components complete and individually tested (steps 41-42)",
+      "tasks": [
+        "E2E: register new account, plan a circular route, walk the route, verify walk history updates and heatmap reflects walked edges",
+        "E2E: social login, plan an A-to-B route, re-plan mid-walk, complete the new route, verify both walk portions in history",
+        "E2E: walk until free tier limit reached, verify planning is blocked, complete upgrade payment, verify planning is restored",
+        "E2E: set path preferences (prefer-not and block), plan a route, verify blocked path is absent and prefer-not path is deprioritized",
+        "E2E: delete account, verify all user data is removed from the database, verify login no longer works",
+        "E2E: simulate interrupted walk (app close), reopen app, verify partial walk data uploads and merges correctly"
+      ],
+      "definition_of_done": [
+        "All end-to-end test scenarios pass",
+        "User journeys verified across client and server interaction",
+        "Freemium boundary conditions tested at the 100km threshold",
+        "Account deletion verified as removing all data from all tables",
+        "Interrupted walk recovery verified with data integrity"
+      ]
+    },
+    {
+      "step": 44,
+      "title": "Deployment and CI/CD configuration",
+      "goal": "Set up production deployment for all infrastructure components and continuous integration pipeline.",
+      "input": "All components complete and tested (steps 1-43)",
+      "tasks": [
+        "Containerize the Rust/Axum server (Dockerfile, health check, graceful shutdown)",
+        "Configure PostgreSQL deployment with PostGIS and pgRouting extensions enabled",
+        "Configure tile server deployment with OSM data volume",
+        "Set up CI pipeline: run server unit and integration tests, Flutter widget and integration tests on every commit",
+        "Configure Flutter build pipelines for iOS (App Store), Android (Play Store), and web deployment",
+        "Set up production environment configuration (secrets management, database URLs, JWT keys, OAuth credentials, payment provider keys)",
+        "Document and configure OSM data refresh scheduling (periodic re-import with stable edge IDs)",
+        "Configure server retry behavior for transient connectivity failures to external services"
+      ],
+      "definition_of_done": [
+        "Server deploys, starts, and passes health check in production environment",
+        "Database migrations apply cleanly in production",
+        "Tile server serves tiles in production",
+        "CI pipeline runs full test suite on every commit and blocks on failure",
+        "Flutter apps build successfully for all three platforms",
+        "Production secrets are managed securely outside of source control",
+        "OSM data refresh process is documented with a runnable schedule"
+      ]
+    }
+  ],
+  "generated_at": "2026-03-01T10:06:29.477294",
+  "source_design": "design.md"
+}

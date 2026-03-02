@@ -36,6 +36,7 @@ STATE_FILE      = "orchestrator_state.json"
 LOG_FILE        = "orchestrator.log"
 MAX_DEV_RETRIES = 3
 MAX_REF_RETRIES = 2
+MAX_SEC_RETRIES = 3
 CLAUDE_TIMEOUT  = 1800
 
 # ---------------------------------------------------------------------------
@@ -276,11 +277,15 @@ log = logging.getLogger(__name__)
 # State
 # ---------------------------------------------------------------------------
 
+PHASE_ORDER = ["dev", "refactor", "security"]
+
+
 def load_state() -> dict:
     if Path(STATE_FILE).exists():
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"started_at": None, "completed_steps": [], "failed_steps": []}
+    return {"started_at": None, "completed_steps": [], "failed_steps": [],
+            "step_phases": {}}
 
 
 def save_state(state: dict):
@@ -493,7 +498,8 @@ def commit_step(step: dict, project_dir: str):
     n = step["step"]
     title = step.get("title", "untitled")
     msg = f"Step {n:02d}: {title}"
-    log.info(f"\n  [commit] {msg}")
+    log.info("")
+    log.info(f"  [commit] {msg}")
     try:
         subprocess.run(["git", "add", "-A"], cwd=project_dir, check=True,
                        capture_output=True, timeout=60)
@@ -513,86 +519,130 @@ def commit_step(step: dict, project_dir: str):
         log.warning(f"  [commit] error: {e}")
 
 
-def run_step(step: dict, project_dir: str, env_summary: str, production_components: str) -> bool:
+def _save_phase(state: dict, step_num: int, phase: str):
+    """Record that a phase completed for a step (persisted immediately)."""
+    state.setdefault("step_phases", {})[str(step_num)] = phase
+    save_state(state)
+
+
+def _completed_phases(state: dict, step_num: int) -> set[str]:
+    """Return the set of phases already done for a step."""
+    last = state.get("step_phases", {}).get(str(step_num))
+    if not last or last not in PHASE_ORDER:
+        return set()
+    idx = PHASE_ORDER.index(last)
+    return set(PHASE_ORDER[: idx + 1])
+
+
+def run_step(step: dict, project_dir: str, env_summary: str,
+             production_components: str, state: dict) -> bool:
     n = step["step"]
-    log.info(f"\n{'='*60}")
+    done = _completed_phases(state, n)
+    log.info("")
+    log.info(f"{'='*60}")
     log.info(f"STEP {n:02d}: {step['title']}")
+    if done:
+        log.info(f"  Resuming — phases already done: {', '.join(sorted(done))}")
     log.info(f"{'='*60}")
 
     # --- Dev + Test loop ---
-    log.info(f"\n  [dev loop]")
-    dev_passed = False
-    last_test_output = ""
-    for attempt in range(1, MAX_DEV_RETRIES + 1):
-        log.info(f"  attempt {attempt}/{MAX_DEV_RETRIES}")
-        if attempt == 1:
-            dev_ok, _ = run_dev(step, project_dir, env_summary, production_components)
-        else:
-            dev_ok, _ = run_dev_test_fix(step, project_dir, env_summary,
-                                         production_components, last_test_output)
-        if not dev_ok:
-            log.warning(f"  [dev] FAILED on attempt {attempt}")
-        else:
-            test_ok, last_test_output = run_test(step, project_dir)
-            if test_ok:
-                log.info(f"  [test] PASS — dev loop done")
-                dev_passed = True
-                break
+    if "dev" in done:
+        log.info(f"  [dev loop] skipping (already completed)")
+    else:
+        log.info("")
+        log.info(f"  [dev loop]")
+        dev_passed = False
+        last_test_output = ""
+        for attempt in range(1, MAX_DEV_RETRIES + 1):
+            log.info(f"  attempt {attempt}/{MAX_DEV_RETRIES}")
+            if attempt == 1:
+                dev_ok, _ = run_dev(step, project_dir, env_summary, production_components)
             else:
-                log.warning(f"  [test] FAIL — retrying dev with failure details")
-        if attempt == MAX_DEV_RETRIES:
-            log.error(f"  [dev loop] exhausted {MAX_DEV_RETRIES} attempts — STEP FAILED")
-            return False
-        time.sleep(3)
-
-    if not dev_passed:
-        return False
-
-    # --- Refactor + Test loop ---
-    log.info(f"\n  [refactor loop]")
-    for attempt in range(1, MAX_REF_RETRIES + 1):
-        ref_ok, _ = run_refactor(step, project_dir)
-        if not ref_ok:
-            log.warning(f"  [refactor] FAILED attempt {attempt} — skipping refactor")
-            break
-        test_ok, test_output = run_test(step, project_dir)
-        if test_ok:
-            log.info(f"  [test] PASS after refactor")
-            break
-        else:
-            log.warning(f"  [test] FAIL after refactor attempt {attempt}")
-            if attempt == MAX_REF_RETRIES:
-                log.error(f"  [refactor] broke tests — STEP FAILED")
-                return False
-            fix_ok, _ = run_refactor_test_fix(step, project_dir, test_output)
-            if not fix_ok:
-                log.error(f"  [refactor/test-fix] could not fix — STEP FAILED")
+                dev_ok, _ = run_dev_test_fix(step, project_dir, env_summary,
+                                             production_components, last_test_output)
+            if not dev_ok:
+                log.warning(f"  [dev] FAILED on attempt {attempt}")
+            else:
+                test_ok, last_test_output = run_test(step, project_dir)
+                if test_ok:
+                    log.info(f"  [test] PASS — dev loop done")
+                    dev_passed = True
+                    break
+                else:
+                    log.warning(f"  [test] FAIL — retrying dev with failure details")
+            if attempt == MAX_DEV_RETRIES:
+                log.error(f"  [dev loop] exhausted {MAX_DEV_RETRIES} attempts — STEP FAILED")
                 return False
             time.sleep(3)
 
-    # --- Security ---
-    log.info(f"\n  [security review]")
+        if not dev_passed:
+            return False
+
+        _save_phase(state, n, "dev")
+
+    # --- Refactor + Test loop ---
+    if "refactor" in done:
+        log.info(f"  [refactor loop] skipping (already completed)")
+    else:
+        log.info("")
+        log.info(f"  [refactor loop]")
+        for attempt in range(1, MAX_REF_RETRIES + 1):
+            ref_ok, _ = run_refactor(step, project_dir)
+            if not ref_ok:
+                log.warning(f"  [refactor] FAILED attempt {attempt} — skipping refactor")
+                break
+            test_ok, test_output = run_test(step, project_dir)
+            if test_ok:
+                log.info(f"  [test] PASS after refactor")
+                break
+            else:
+                log.warning(f"  [test] FAIL after refactor attempt {attempt}")
+                if attempt == MAX_REF_RETRIES:
+                    log.error(f"  [refactor] broke tests — STEP FAILED")
+                    return False
+                fix_ok, _ = run_refactor_test_fix(step, project_dir, test_output)
+                if not fix_ok:
+                    log.error(f"  [refactor/test-fix] could not fix — STEP FAILED")
+                    return False
+                time.sleep(3)
+
+        _save_phase(state, n, "refactor")
+
+    # --- Security + Fix loop ---
+    log.info("")
+    log.info(f"  [security loop]")
     sec_ok, sec_output = run_security(step, project_dir, production_components)
-    if not sec_ok:
-        log.warning(f"  [security] issues found — running security-fix agent")
+    for sec_attempt in range(1, MAX_SEC_RETRIES + 1):
+        if sec_ok:
+            break
+
+        log.warning(f"  [security] issues found — fix attempt {sec_attempt}/{MAX_SEC_RETRIES}")
         fix_ok, _ = run_security_fix(step, project_dir, env_summary,
                                      production_components, sec_output)
         if not fix_ok:
             log.error(f"  [security-fix] could not fix issues — STEP FAILED")
             return False
+
         test_ok, _ = run_test(step, project_dir)
         if not test_ok:
             log.error(f"  [security fix] broke tests — STEP FAILED")
             return False
-        sec_ok, _ = run_security(step, project_dir, production_components)
-        if not sec_ok:
-            log.error(f"  [security] unresolved issues — STEP FAILED")
-            return False
+
+        sec_ok, sec_output = run_security(step, project_dir, production_components)
+        time.sleep(3)
+
+    if not sec_ok:
+        log.error(f"  [security] unresolved issues after {MAX_SEC_RETRIES} fix attempts — STEP FAILED")
+        return False
 
     # --- Commit ---
     commit_step(step, project_dir)
 
-    log.info(f"\n  STEP {n:02d} COMPLETE")
+    # Step complete — clean up phase tracking
+    state.get("step_phases", {}).pop(str(n), None)
+
+    log.info("")
+    log.info(f"  STEP {n:02d} COMPLETE")
     return True
 
 # ---------------------------------------------------------------------------
@@ -651,7 +701,7 @@ def main():
             log.info(f"Skipping step {n:02d} (already completed)")
             continue
 
-        success = run_step(step, project_dir, env_summary, production_components)
+        success = run_step(step, project_dir, env_summary, production_components, state)
 
         if success:
             state["completed_steps"].append(n)
@@ -662,14 +712,16 @@ def main():
             if n not in state["failed_steps"]:
                 state["failed_steps"].append(n)
             save_state(state)
-            log.error(f"\nStep {n:02d} FAILED. Orchestrator stopped.")
+            log.error("")
+            log.error(f"Step {n:02d} FAILED. Orchestrator stopped.")
             log.error(f"Fix the issue then resume with:")
             log.error(f"  python orchestrator.py --from-step {n} --config {args.config}")
             sys.exit(1)
 
         save_state(state)
 
-    log.info(f"\n{'='*60}")
+    log.info("")
+    log.info(f"{'='*60}")
     log.info(f"ALL {len(steps)} STEPS COMPLETE")
     log.info(f"{'='*60}")
 
