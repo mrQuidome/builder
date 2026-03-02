@@ -514,7 +514,10 @@ def commit_step(step: dict, project_dir: str):
                        capture_output=True, timeout=60)
         log.info(f"  [commit] done")
     except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode(errors="replace").strip()
         log.warning(f"  [commit] failed: {e}")
+        if stderr:
+            log.warning(f"  [commit] stderr: {stderr}")
     except Exception as e:
         log.warning(f"  [commit] error: {e}")
 
