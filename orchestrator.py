@@ -609,31 +609,36 @@ def run_step(step: dict, project_dir: str, env_summary: str,
         _save_phase(state, n, "refactor")
 
     # --- Security + Fix loop ---
-    log.info("")
-    log.info(f"  [security loop]")
-    sec_ok, sec_output = run_security(step, project_dir, production_components)
-    for sec_attempt in range(1, MAX_SEC_RETRIES + 1):
-        if sec_ok:
-            break
-
-        log.warning(f"  [security] issues found — fix attempt {sec_attempt}/{MAX_SEC_RETRIES}")
-        fix_ok, _ = run_security_fix(step, project_dir, env_summary,
-                                     production_components, sec_output)
-        if not fix_ok:
-            log.error(f"  [security-fix] could not fix issues — STEP FAILED")
-            return False
-
-        test_ok, _ = run_test(step, project_dir)
-        if not test_ok:
-            log.error(f"  [security fix] broke tests — STEP FAILED")
-            return False
-
+    if "security" in done:
+        log.info(f"  [security loop] skipping (already completed)")
+    else:
+        log.info("")
+        log.info(f"  [security loop]")
         sec_ok, sec_output = run_security(step, project_dir, production_components)
-        time.sleep(3)
+        for sec_attempt in range(1, MAX_SEC_RETRIES + 1):
+            if sec_ok:
+                break
 
-    if not sec_ok:
-        log.error(f"  [security] unresolved issues after {MAX_SEC_RETRIES} fix attempts — STEP FAILED")
-        return False
+            log.warning(f"  [security] issues found — fix attempt {sec_attempt}/{MAX_SEC_RETRIES}")
+            fix_ok, _ = run_security_fix(step, project_dir, env_summary,
+                                         production_components, sec_output)
+            if not fix_ok:
+                log.error(f"  [security-fix] could not fix issues — STEP FAILED")
+                return False
+
+            test_ok, _ = run_test(step, project_dir)
+            if not test_ok:
+                log.error(f"  [security fix] broke tests — STEP FAILED")
+                return False
+
+            sec_ok, sec_output = run_security(step, project_dir, production_components)
+            time.sleep(3)
+
+        if not sec_ok:
+            log.error(f"  [security] unresolved issues after {MAX_SEC_RETRIES} fix attempts — STEP FAILED")
+            return False
+
+        _save_phase(state, n, "security")
 
     # --- Commit ---
     commit_step(step, project_dir)
