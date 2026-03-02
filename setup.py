@@ -123,7 +123,7 @@ INSTRUCTIONS:
 - Append or update each variable in /etc/environment.
 - Create all project directories with appropriate permissions.
 - Run `git init` inside each project directory so they are ready for version control.
-  Set local git config: user.name "builder" and user.email "builder@localhost".
+  Set local git config: user.name "{git_user_name}" and user.email "{git_user_email}".
 - When done output one of these exact lines:
   AGENT_RESULT: DONE
   AGENT_RESULT: FAILED
@@ -417,11 +417,14 @@ def run_env_setup(config: dict) -> bool:
     log.info(f"PHASE: Environment variables and project directories")
     log.info(f"{'='*60}")
 
+    git_cfg = config.get("git", {})
     prompt = SETUP_ENV_PROMPT.format(
         os=config["system"]["os"],
         run_as=config["system"]["run_as"],
         env_json=json.dumps(config["env_vars"], indent=2),
         dirs_json=json.dumps(config.get("project_dirs", []), indent=2),
+        git_user_name=git_cfg.get("user_name", "builder"),
+        git_user_email=git_cfg.get("user_email", "builder@localhost"),
     )
 
     output = call_claude(prompt, "env_setup")

@@ -98,7 +98,11 @@ OUTPUT RULES:
         "path": "<absolute path on VPS>",
         "notes": "<what lives here>"
       }}
-    ]
+    ],
+    "git": {{
+      "user_name": "Freek van Keulen",
+      "user_email": "freek@quidome.nl"
+    }}
   }}
 """.strip()
 

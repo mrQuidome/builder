@@ -493,21 +493,23 @@ def build_production_components(config: dict) -> str:
     return "\n".join(lines) if lines else "  (none listed)"
 
 
-def _ensure_git_repo(project_dir: str):
+def _ensure_git_repo(project_dir: str, git_cfg: dict):
     """Initialise a git repo in project_dir if one doesn't exist yet."""
     git_dir = os.path.join(project_dir, ".git")
     if os.path.isdir(git_dir):
         return
+    user_name = git_cfg.get("user_name", "builder")
+    user_email = git_cfg.get("user_email", "builder@localhost")
     log.info(f"  [commit] no .git found – running git init in {project_dir}")
     subprocess.run(["git", "init"], cwd=project_dir, check=True,
                    capture_output=True, timeout=30)
-    subprocess.run(["git", "config", "user.name", "builder"],
+    subprocess.run(["git", "config", "user.name", user_name],
                    cwd=project_dir, check=True, capture_output=True, timeout=10)
-    subprocess.run(["git", "config", "user.email", "builder@localhost"],
+    subprocess.run(["git", "config", "user.email", user_email],
                    cwd=project_dir, check=True, capture_output=True, timeout=10)
 
 
-def commit_step(step: dict, project_dir: str):
+def commit_step(step: dict, project_dir: str, git_cfg: dict):
     """Git add + commit all changes for the completed step."""
     n = step["step"]
     title = step.get("title", "untitled")
@@ -515,7 +517,7 @@ def commit_step(step: dict, project_dir: str):
     log.info("")
     log.info(f"  [commit] {msg}")
     try:
-        _ensure_git_repo(project_dir)
+        _ensure_git_repo(project_dir, git_cfg)
         subprocess.run(["git", "add", "-A"], cwd=project_dir, check=True,
                        capture_output=True, timeout=60)
         result = subprocess.run(
@@ -553,7 +555,7 @@ def _completed_phases(state: dict, step_num: int) -> set[str]:
 
 
 def run_step(step: dict, project_dir: str, env_summary: str,
-             production_components: str, state: dict) -> bool:
+             production_components: str, state: dict, git_cfg: dict) -> bool:
     n = step["step"]
     done = _completed_phases(state, n)
     log.info("")
@@ -659,7 +661,7 @@ def run_step(step: dict, project_dir: str, env_summary: str,
         _save_phase(state, n, "security")
 
     # --- Commit ---
-    commit_step(step, project_dir)
+    commit_step(step, project_dir, git_cfg)
 
     # Step complete — clean up phase tracking
     state.get("step_phases", {}).pop(str(n), None)
@@ -696,6 +698,7 @@ def main():
     project_dir = get_project_dir(config)
     env_summary = build_env_summary(config)
     production_components = build_production_components(config)
+    git_cfg = config.get("git", {})
 
     steps = plan["steps"]
     if args.step:
@@ -724,7 +727,7 @@ def main():
             log.info(f"Skipping step {n:02d} (already completed)")
             continue
 
-        success = run_step(step, project_dir, env_summary, production_components, state)
+        success = run_step(step, project_dir, env_summary, production_components, state, git_cfg)
 
         if success:
             state["completed_steps"].append(n)
