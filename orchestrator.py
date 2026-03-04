@@ -2,18 +2,20 @@
 """
 Build Orchestrator
 
-Reads unwalked_build_plan.json and setup_config.json, then runs each build
-step through four agents in sequence: Dev -> Test -> Refactor -> Security.
+Single entry point that runs the full pipeline:
+  1. Planning     — generates unwalked_build_plan.json  (planner.py)
+  2. Setup Planning — generates setup_config.json       (setup_planner.py)
+  3. Setup        — provisions environment               (setup.py)
+  4. Build Steps  — Dev -> Test -> Refactor -> Security  (existing logic)
 
 Usage:
-    python orchestrator.py
-    python orchestrator.py --plan unwalked_build_plan.json --config setup_config.json
-    python orchestrator.py --step 7          # run a single step only
-    python orchestrator.py --from-step 5     # resume from step 5
+    python orchestrator.py design.md
+    python orchestrator.py design.md --plan unwalked_build_plan.json --config setup_config.json
+    python orchestrator.py design.md --step 7          # run a single step only
+    python orchestrator.py design.md --from-step 5     # resume from step 5
 
 Requirements:
     claude CLI must be installed and authenticated.
-    setup.py must have completed successfully.
 """
 
 import argparse
@@ -320,7 +322,9 @@ def load_state() -> dict:
         with open(STATE_FILE) as f:
             return json.load(f)
     return {"started_at": None, "completed_steps": [], "failed_steps": [],
-            "step_phases": {}}
+            "step_phases": {},
+            "phase_planning": None, "phase_setup_planning": None,
+            "phase_setup": None}
 
 
 def save_state(state: dict):
@@ -732,27 +736,96 @@ def run_step(step: dict, project_dir: str, env_summary: str,
     return True
 
 # ---------------------------------------------------------------------------
+# Pre-build phases
+# ---------------------------------------------------------------------------
+
+def run_phase(phase_name: str, cmd: list[str], state: dict, state_key: str) -> bool:
+    """Run a pre-build phase via subprocess. Returns True on success."""
+    if state.get(state_key) == "done":
+        log.info(f"  [{phase_name}] skipping (already done)")
+        return True
+
+    log.info(f"  [{phase_name}] running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, timeout=CLAUDE_TIMEOUT)
+    if result.returncode != 0:
+        log.error(f"  [{phase_name}] FAILED (exit code {result.returncode})")
+        return False
+
+    state[state_key] = "done"
+    save_state(state)
+    log.info(f"  [{phase_name}] done")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Build Orchestrator")
-    parser.add_argument("--plan",      default=DEFAULT_PLAN,   help="Build plan JSON")
-    parser.add_argument("--config",    default=DEFAULT_CONFIG, help="Setup config JSON")
+    parser.add_argument("design",                                help="Path to design markdown file")
+    parser.add_argument("--plan",      default=DEFAULT_PLAN,     help="Build plan JSON")
+    parser.add_argument("--config",    default=DEFAULT_CONFIG,   help="Setup config JSON")
     parser.add_argument("--step",      type=int, help="Run only this step number")
     parser.add_argument("--from-step", type=int, help="Start from this step number")
     args = parser.parse_args()
 
+    if not Path(args.design).exists():
+        log.error(f"Design file not found: {args.design}")
+        sys.exit(1)
+
+    state = load_state()
+    if not state["started_at"]:
+        state["started_at"] = datetime.now().isoformat()
+        save_state(state)
+
+    script_dir = Path(__file__).resolve().parent
+
+    log.info(f"Build Orchestrator")
+    log.info(f"Design     : {args.design}")
+
+    # --- Phase 1: Planning ---
+    skip_planning = (state.get("phase_planning") == "done"
+                     and Path(args.plan).exists())
+    if skip_planning:
+        log.info(f"  [planning] skipping (already done)")
+    else:
+        if not run_phase("planning",
+                         ["python3", str(script_dir / "planner.py"),
+                          args.design, "--plan", args.plan],
+                         state, "phase_planning"):
+            sys.exit(1)
+
+    # --- Phase 2: Setup Planning ---
+    skip_setup_planning = (state.get("phase_setup_planning") == "done"
+                           and Path(args.config).exists())
+    if skip_setup_planning:
+        log.info(f"  [setup-planning] skipping (already done)")
+    else:
+        if not run_phase("setup-planning",
+                         ["python3", str(script_dir / "setup_planner.py"),
+                          args.design, "--config", args.config],
+                         state, "phase_setup_planning"):
+            sys.exit(1)
+
+    # --- Phase 3: Setup ---
+    if not run_phase("setup",
+                     ["python3", str(script_dir / "setup.py"),
+                      "--config", args.config],
+                     state, "phase_setup"):
+        sys.exit(1)
+
+    # --- Phase 4: Build Steps ---
     # Load plan
     if not Path(args.plan).exists():
-        log.error(f"Plan not found: {args.plan} — run planner.py first")
+        log.error(f"Plan not found: {args.plan}")
         sys.exit(1)
     with open(args.plan) as f:
         plan = json.load(f)
 
     # Load config
     if not Path(args.config).exists():
-        log.error(f"Config not found: {args.config} — run planner.py and setup.py first")
+        log.error(f"Config not found: {args.config}")
         sys.exit(1)
     config = load_config(args.config)
     apply_env_to_process(config)
@@ -760,6 +833,10 @@ def main():
     env_summary = build_env_summary(config)
     production_components = build_production_components(config)
     git_cfg = config.get("git", {})
+
+    log.info(f"Plan       : {args.plan}")
+    log.info(f"Config     : {args.config}")
+    log.info(f"Project dir: {project_dir}")
 
     steps = plan["steps"]
     if args.step:
@@ -770,15 +847,6 @@ def main():
     elif args.from_step:
         steps = [s for s in steps if s["step"] >= args.from_step]
 
-    state = load_state()
-    if not state["started_at"]:
-        state["started_at"] = datetime.now().isoformat()
-        save_state(state)
-
-    log.info(f"Build Orchestrator")
-    log.info(f"Plan       : {args.plan}")
-    log.info(f"Config     : {args.config}")
-    log.info(f"Project dir: {project_dir}")
     log.info(f"Steps      : {len(steps)}")
 
     for step in steps:
@@ -802,7 +870,7 @@ def main():
             log.error("")
             log.error(f"Step {n:02d} FAILED. Orchestrator stopped.")
             log.error(f"Fix the issue then resume with:")
-            log.error(f"  python orchestrator.py --from-step {n} --config {args.config}")
+            log.error(f"  python orchestrator.py {args.design} --from-step {n}")
             sys.exit(1)
 
         save_state(state)
