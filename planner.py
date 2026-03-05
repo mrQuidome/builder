@@ -2,12 +2,11 @@
 """
 Planner Agent
 
-Reads a technical design markdown file and produces a sequenced build plan:
-  - unwalked_build_plan.json   sequential build steps for the orchestrator
+Reads functional and technical design docs and produces a sequenced build plan.
 
 Usage:
-    python planner.py design.md
-    python planner.py design.md --plan my_plan.json
+    python planner.py functional_design.md technical_design.md
+    python planner.py functional_design.md technical_design.md --plan build_plan.json --log-dir /tmp/logs
 
 Requirements:
     claude CLI must be installed and authenticated on this machine.
@@ -25,7 +24,7 @@ from planner_common import call_claude, extract_json, save_raw, setup_logging
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_PLAN = "unwalked_build_plan.json"
+DEFAULT_PLAN = "build_plan.json"
 
 # ---------------------------------------------------------------------------
 # Prompt
@@ -83,25 +82,32 @@ CHUNKING RULES:
 # ---------------------------------------------------------------------------
 
 def main():
-    log = setup_logging("planner.log")
-
     parser = argparse.ArgumentParser(description="Planner Agent — build plan generator")
-    parser.add_argument("design", help="Path to technical design markdown file")
+    parser.add_argument("design_docs", nargs="+", help="Paths to design markdown files")
     parser.add_argument("--plan", default=DEFAULT_PLAN, help="Build plan output path")
+    parser.add_argument("--log-dir", default=None, help="Directory for log files")
     args = parser.parse_args()
 
-    design_path = Path(args.design)
-    if not design_path.exists():
-        log.error(f"Design file not found: {design_path}")
-        sys.exit(1)
+    log = setup_logging("planner.log", log_dir=args.log_dir)
 
-    design = design_path.read_text()
-    log.info(f"Design  : {design_path} ({len(design)} chars)")
+    # Read and concatenate all design docs
+    design_parts = []
+    for doc_path_str in args.design_docs:
+        doc_path = Path(doc_path_str)
+        if not doc_path.exists():
+            log.error(f"Design file not found: {doc_path}")
+            sys.exit(1)
+        content = doc_path.read_text()
+        design_parts.append(f"# --- {doc_path.name} ---\n\n{content}")
+        log.info(f"Design  : {doc_path} ({len(content)} chars)")
+
+    design = "\n\n".join(design_parts)
     log.info(f"Plan    : {args.plan}")
 
     # --- Build plan ---
-    raw_plan = call_claude(PLAN_PROMPT.format(design=design), "build_plan", log)
-    save_raw(raw_plan, "planner_raw_plan.txt", log)
+    raw_plan = call_claude(PLAN_PROMPT.format(design=design), "build_plan", log,
+                           log_dir=args.log_dir)
+    save_raw(raw_plan, "planner_raw_plan.txt", log, log_dir=args.log_dir)
     plan = extract_json(raw_plan, log)
 
     if plan.get("status") == "blocked":
@@ -116,14 +122,14 @@ def main():
         sys.exit(1)
 
     plan["generated_at"] = datetime.now().isoformat()
-    plan["source_design"] = str(design_path)
+    plan["source_designs"] = args.design_docs
 
     Path(args.plan).write_text(json.dumps(plan, indent=2))
     log.info(f"\nBuild plan: {len(plan['steps'])} steps")
     for s in plan["steps"]:
         log.info(f"  Step {s['step']:02d}: {s['title']}")
 
-    log.info(f"\nDone. Next: python setup_planner.py {args.design}")
+    log.info(f"\nDone. Next: python setup_planner.py {' '.join(args.design_docs)}")
 
 
 if __name__ == "__main__":

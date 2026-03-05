@@ -2,12 +2,11 @@
 """
 Setup Planner Agent
 
-Reads a technical design markdown file and produces the setup configuration:
-  - setup_config.json   all tools, versions, credentials, env vars
+Reads functional and technical design docs and produces the setup configuration.
 
 Usage:
-    python setup_planner.py design.md
-    python setup_planner.py design.md --config my_config.json
+    python setup_planner.py functional_design.md technical_design.md
+    python setup_planner.py functional_design.md technical_design.md --config setup_config.json --log-dir /tmp/logs
 
 Requirements:
     claude CLI must be installed and authenticated on this machine.
@@ -79,7 +78,8 @@ OUTPUT RULES:
         ],
         "systemd_unit": "<unit name or null>",
         "validate_cmd": "<command to confirm service is healthy>",
-        "validate_expect": "<expected output or substring>"
+        "validate_expect": "<expected output or substring>",
+        "defer_validation": "<true if the service is the application being built from source and its binary does not exist yet; false for pre-installed infrastructure services like databases and web servers>"
       }}
     ],
     "env_vars": [
@@ -111,25 +111,32 @@ OUTPUT RULES:
 # ---------------------------------------------------------------------------
 
 def main():
-    log = setup_logging("setup_planner.log")
-
     parser = argparse.ArgumentParser(description="Setup Planner Agent — setup config generator")
-    parser.add_argument("design", help="Path to technical design markdown file")
+    parser.add_argument("design_docs", nargs="+", help="Paths to design markdown files")
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="Setup config output path")
+    parser.add_argument("--log-dir", default=None, help="Directory for log files")
     args = parser.parse_args()
 
-    design_path = Path(args.design)
-    if not design_path.exists():
-        log.error(f"Design file not found: {design_path}")
-        sys.exit(1)
+    log = setup_logging("setup_planner.log", log_dir=args.log_dir)
 
-    design = design_path.read_text()
-    log.info(f"Design  : {design_path} ({len(design)} chars)")
+    # Read and concatenate all design docs
+    design_parts = []
+    for doc_path_str in args.design_docs:
+        doc_path = Path(doc_path_str)
+        if not doc_path.exists():
+            log.error(f"Design file not found: {doc_path}")
+            sys.exit(1)
+        content = doc_path.read_text()
+        design_parts.append(f"# --- {doc_path.name} ---\n\n{content}")
+        log.info(f"Design  : {doc_path} ({len(content)} chars)")
+
+    design = "\n\n".join(design_parts)
     log.info(f"Config  : {args.config}")
 
     # --- Setup config ---
-    raw_config = call_claude(SETUP_PROMPT.format(design=design), "setup_config", log)
-    save_raw(raw_config, "planner_raw_config.txt", log)
+    raw_config = call_claude(SETUP_PROMPT.format(design=design), "setup_config", log,
+                             log_dir=args.log_dir)
+    save_raw(raw_config, "planner_raw_config.txt", log, log_dir=args.log_dir)
     config = extract_json(raw_config, log)
 
     if config.get("status") != "ok":
@@ -137,7 +144,7 @@ def main():
         sys.exit(1)
 
     config["generated_at"] = datetime.now().isoformat()
-    config["source_design"] = str(design_path)
+    config["source_designs"] = args.design_docs
     config["install_results"] = []   # setup.py will populate this
 
     Path(args.config).write_text(json.dumps(config, indent=2))

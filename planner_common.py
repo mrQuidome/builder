@@ -14,8 +14,14 @@ from pathlib import Path
 CLAUDE_TIMEOUT = 600
 
 
-def setup_logging(log_file: str) -> logging.Logger:
-    """Configure and return a logger that writes to both file and stdout."""
+def setup_logging(log_file: str, log_dir: str | None = None) -> logging.Logger:
+    """Configure and return a logger that writes to both file and stdout.
+
+    If log_dir is provided, the log file is placed inside that directory.
+    """
+    if log_dir:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        log_file = str(Path(log_dir) / log_file)
     logger = logging.getLogger(log_file)
     logger.setLevel(logging.INFO)
     if not logger.handlers:
@@ -37,11 +43,17 @@ def restore_terminal():
         pass
 
 
-def call_claude(prompt: str, label: str, log: logging.Logger) -> str:
+def call_claude(prompt: str, label: str, log: logging.Logger,
+                log_dir: str | None = None) -> str:
     """Send a prompt to the claude CLI and return its stdout."""
     slug = label.replace(" ", "_")
-    stdout_path = f"claude_{slug}_stdout.log"
-    stderr_path = f"claude_{slug}_stderr.log"
+    if log_dir:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        stdout_path = str(Path(log_dir) / f"claude_{slug}_stdout.log")
+        stderr_path = str(Path(log_dir) / f"claude_{slug}_stderr.log")
+    else:
+        stdout_path = f"claude_{slug}_stdout.log"
+        stderr_path = f"claude_{slug}_stderr.log"
     log.info(f"Calling claude [{label}]  stdout -> {stdout_path}  stderr -> {stderr_path}")
 
     with open(stdout_path, "w") as fout, open(stderr_path, "w") as ferr:
@@ -92,7 +104,13 @@ def extract_json(raw: str, log: logging.Logger) -> dict:
         sys.exit(1)
 
 
-def save_raw(raw: str, filename: str, log: logging.Logger):
+def save_raw(raw: str, filename: str, log: logging.Logger,
+             log_dir: str | None = None):
     """Save raw claude output to a file for debugging."""
-    Path(filename).write_text(raw)
-    log.info(f"Raw output saved to {filename}")
+    if log_dir:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        filepath = Path(log_dir) / filename
+    else:
+        filepath = Path(filename)
+    filepath.write_text(raw)
+    log.info(f"Raw output saved to {filepath}")

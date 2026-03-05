@@ -34,7 +34,6 @@ from pathlib import Path
 
 DEFAULT_CONFIG  = "setup_config.json"
 CLAUDE_TIMEOUT  = 600   # installs can be slow
-LOG_FILE        = "setup.log"
 
 # ---------------------------------------------------------------------------
 # Agent prompts
@@ -78,8 +77,11 @@ INSTRUCTIONS:
   database name from DATABASE_URL. Enable required extensions (e.g. PostGIS,
   pgRouting) inside the database.
 - Apply all config_files changes described in the spec.
-- Enable and start the systemd unit if specified.
-- Run the validate_cmd and confirm output contains validate_expect.
+- If the service has "defer_validation": true, configure everything (config files,
+  systemd unit file, .env) but do NOT start the service and do NOT run validate_cmd.
+  Report AGENT_RESULT: DONE after configuration is complete.
+- Otherwise, enable and start the systemd unit if specified, and run the validate_cmd
+  and confirm output contains validate_expect.
 - When done output one of these exact lines:
   AGENT_RESULT: DONE
   AGENT_RESULT: FAILED
@@ -131,18 +133,13 @@ INSTRUCTIONS:
 """.strip()
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (configured in main() after parsing args)
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 log = logging.getLogger(__name__)
+
+# Set in main() so phase functions can use it
+_log_dir: str | None = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -156,10 +153,10 @@ def restore_terminal():
         pass
 
 
-def call_claude(prompt: str, label: str) -> str:
+def call_claude(prompt: str, label: str, agent_log_dir: str | None = None) -> str:
     slug = label.replace(" ", "_").replace("/", "_")
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
+    log_dir = Path(agent_log_dir) if agent_log_dir else Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S")
     stdout_path = log_dir / f"setup_{slug}_{ts}_stdout.log"
     stderr_path = log_dir / f"setup_{slug}_{ts}_stderr.log"
@@ -363,9 +360,12 @@ def preflight_checks(config: dict) -> bool:
 
 def run_generate_secrets(config: dict) -> bool:
     """Phase 0: auto-generate secrets marked with source=generate."""
-    gen_vars = [v for v in config["env_vars"] if v.get("source") == "generate"]
+    gen_vars = [
+        v for v in config["env_vars"]
+        if v.get("source") == "generate" and not v.get("value")
+    ]
     if not gen_vars:
-        log.info("  No secrets to auto-generate.")
+        log.info("  No secrets to auto-generate (all already have values).")
         return True
 
     log.info(f"\n{'='*60}")
@@ -378,7 +378,7 @@ def run_generate_secrets(config: dict) -> bool:
         secrets_json=json.dumps(gen_vars, indent=2),
     )
 
-    output = call_claude(prompt, "generate_secrets")
+    output = call_claude(prompt, "generate_secrets", agent_log_dir=_log_dir)
 
     # Parse the JSON mapping from the output
     try:
@@ -427,7 +427,7 @@ def run_env_setup(config: dict) -> bool:
         git_user_email=git_cfg.get("user_email", "builder@localhost"),
     )
 
-    output = call_claude(prompt, "env_setup")
+    output = call_claude(prompt, "env_setup", agent_log_dir=_log_dir)
     result = parse_result(output)
     log.info(f"  [env setup] -> {result}")
 
@@ -451,7 +451,7 @@ def run_tool_install(tool: dict, config: dict) -> bool:
     )
 
     for attempt in range(1, 3):  # retry once
-        output = call_claude(prompt, f"tool_{name}_attempt{attempt}")
+        output = call_claude(prompt, f"tool_{name}_attempt{attempt}", agent_log_dir=_log_dir)
         result = parse_result(output)
         log.info(f"  [{name}] attempt {attempt} -> {result}")
 
@@ -468,7 +468,8 @@ def run_tool_install(tool: dict, config: dict) -> bool:
 
 def run_service_configure(service: dict, config: dict) -> bool:
     name = service["name"]
-    log.info(f"\n  Configuring service: {name}")
+    deferred = service.get("defer_validation", False)
+    log.info(f"\n  Configuring service: {name}{'  (validation deferred)' if deferred else ''}")
 
     prompt = CONFIGURE_SERVICE_PROMPT.format(
         os=config["system"]["os"],
@@ -478,12 +479,13 @@ def run_service_configure(service: dict, config: dict) -> bool:
     )
 
     for attempt in range(1, 3):  # retry once
-        output = call_claude(prompt, f"service_{name}_attempt{attempt}")
+        output = call_claude(prompt, f"service_{name}_attempt{attempt}", agent_log_dir=_log_dir)
         result = parse_result(output)
         log.info(f"  [{name}] attempt {attempt} -> {result}")
 
         if result == "DONE":
-            record_result(config, "service", name, "ok")
+            status = "ok (deferred)" if deferred else "ok"
+            record_result(config, "service", name, status)
             return True
 
         if attempt < 2:
@@ -499,7 +501,23 @@ def run_service_configure(service: dict, config: dict) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Setup Agent")
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="Setup config JSON file")
+    parser.add_argument("--log-dir", default=None, help="Directory for log files")
     args = parser.parse_args()
+
+    # Configure logging
+    global _log_dir
+    _log_dir = args.log_dir
+    log_file = str(Path(args.log_dir) / "setup.log") if args.log_dir else "setup.log"
+    if args.log_dir:
+        Path(args.log_dir).mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
 
     config_path = Path(args.config)
     if not config_path.exists():
@@ -529,31 +547,47 @@ def main():
     if os.geteuid() != 0:
         config["system"]["run_as"] = f"user {os.getenv('USER', 'builder')} with sudo"
 
-    # Clear stale install_results from previous failed runs
-    config["install_results"] = []
+    # Build a set of previously-succeeded items so we can skip them on re-run.
+    prev_ok = set()
+    for r in config.get("install_results", []):
+        if r["status"].startswith("ok"):
+            prev_ok.add((r["type"], r["name"]))
+
+    # Clear failed results but keep successful ones
+    config["install_results"] = [
+        r for r in config.get("install_results", [])
+        if r["status"].startswith("ok")
+    ]
 
     failed = []
 
     # --- Phase 0: auto-generate secrets ---
-    if not run_generate_secrets(config):
+    if ("secrets", "generate") in prev_ok:
+        log.info("  Secrets already generated — skipping.")
+    elif not run_generate_secrets(config):
         log.error("Secret generation failed — cannot continue.")
         save_config(config, args.config)
         sys.exit(1)
     save_config(config, args.config)
 
     # --- Phase 1: env vars and directories ---
-    if not run_env_setup(config):
+    if ("env", "environment") in prev_ok:
+        log.info("  Environment already configured — skipping.")
+    elif not run_env_setup(config):
         log.error("Environment setup failed — cannot continue.")
         save_config(config, args.config)
         sys.exit(1)
     save_config(config, args.config)
 
     # --- Phase 2: tools ---
+    tools_to_install = [t for t in config["tools"] if ("tool", t["name"]) not in prev_ok]
+    skipped_tools = len(config["tools"]) - len(tools_to_install)
+
     log.info(f"\n{'='*60}")
-    log.info(f"PHASE: Tool installation ({len(config['tools'])} tools)")
+    log.info(f"PHASE: Tool installation ({len(tools_to_install)} to install, {skipped_tools} already done)")
     log.info(f"{'='*60}")
 
-    for tool in config["tools"]:
+    for tool in tools_to_install:
         ok = run_tool_install(tool, config)
         save_config(config, args.config)  # save after every tool
         if not ok:
@@ -564,11 +598,14 @@ def main():
             sys.exit(1)
 
     # --- Phase 3: services ---
+    services_to_configure = [s for s in config["services"] if ("service", s["name"]) not in prev_ok]
+    skipped_services = len(config["services"]) - len(services_to_configure)
+
     log.info(f"\n{'='*60}")
-    log.info(f"PHASE: Service configuration ({len(config['services'])} services)")
+    log.info(f"PHASE: Service configuration ({len(services_to_configure)} to configure, {skipped_services} already done)")
     log.info(f"{'='*60}")
 
-    for service in config["services"]:
+    for service in services_to_configure:
         ok = run_service_configure(service, config)
         save_config(config, args.config)  # save after every service
         if not ok:

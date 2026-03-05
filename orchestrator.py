@@ -3,16 +3,21 @@
 Build Orchestrator
 
 Single entry point that runs the full pipeline:
-  1. Planning     — generates unwalked_build_plan.json  (planner.py)
-  2. Setup Planning — generates setup_config.json       (setup_planner.py)
-  3. Setup        — provisions environment               (setup.py)
-  4. Build Steps  — Dev -> Test -> Refactor -> Security  (existing logic)
+  1. Planning       — generates .builder/build_plan.json    (planner.py)
+  2. Setup Planning — generates .builder/setup_config.json  (setup_planner.py)
+  3. Setup          — provisions environment                 (setup.py)
+  4. Build Steps    — Dev -> Test -> Refactor -> Security    (existing logic)
 
 Usage:
-    python orchestrator.py design.md
-    python orchestrator.py design.md --plan unwalked_build_plan.json --config setup_config.json
-    python orchestrator.py design.md --step 7          # run a single step only
-    python orchestrator.py design.md --from-step 5     # resume from step 5
+    python orchestrator.py /opt/auth-service
+    python orchestrator.py /opt/auth-service --step 7          # run a single step only
+    python orchestrator.py /opt/auth-service --from-step 5     # resume from step 5
+
+The project folder must contain:
+    docs/functional_design.md
+    docs/technical_design.md
+
+All build artifacts are stored under <project>/.builder/
 
 Requirements:
     claude CLI must be installed and authenticated.
@@ -32,10 +37,6 @@ from pathlib import Path
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_PLAN    = "unwalked_build_plan.json"
-DEFAULT_CONFIG  = "setup_config.json"
-STATE_FILE      = "orchestrator_state.json"
-LOG_FILE        = "orchestrator.log"
 MAX_DEV_RETRIES = 3
 MAX_REF_RETRIES = 2
 MAX_SEC_RETRIES = 3
@@ -297,17 +298,9 @@ If you cannot resolve both the security issues and the test failures, output:
 """.strip()
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (configured in main() after parsing args)
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -316,10 +309,13 @@ log = logging.getLogger(__name__)
 
 PHASE_ORDER = ["dev", "refactor", "security"]
 
+# Set in main() so all functions can access the state file path
+_state_file: str = ""
+
 
 def load_state() -> dict:
-    if Path(STATE_FILE).exists():
-        with open(STATE_FILE) as f:
+    if Path(_state_file).exists():
+        with open(_state_file) as f:
             return json.load(f)
     return {"started_at": None, "completed_steps": [], "failed_steps": [],
             "step_phases": {},
@@ -328,7 +324,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
+    with open(_state_file, "w") as f:
         json.dump(state, f, indent=2)
 
 # ---------------------------------------------------------------------------
@@ -378,9 +374,13 @@ def restore_terminal():
         pass
 
 
+# Set in main() so run_claude can use it
+_agent_log_dir: str = ""
+
+
 def run_claude(prompt: str, step_num: int, agent: str, project_dir: str) -> str:
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
+    log_dir = Path(_agent_log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S")
     stdout_path = log_dir / f"step_{step_num:02d}_{agent}_{ts}_stdout.log"
     stderr_path = log_dir / f"step_{step_num:02d}_{agent}_{ts}_stderr.log"
@@ -762,17 +762,53 @@ def run_phase(phase_name: str, cmd: list[str], state: dict, state_key: str) -> b
 # ---------------------------------------------------------------------------
 
 def main():
+    global _state_file, _agent_log_dir
+
     parser = argparse.ArgumentParser(description="Build Orchestrator")
-    parser.add_argument("design",                                help="Path to design markdown file")
-    parser.add_argument("--plan",      default=DEFAULT_PLAN,     help="Build plan JSON")
-    parser.add_argument("--config",    default=DEFAULT_CONFIG,   help="Setup config JSON")
-    parser.add_argument("--step",      type=int, help="Run only this step number")
-    parser.add_argument("--from-step", type=int, help="Start from this step number")
+    parser.add_argument("project_dir",               help="Path to project folder")
+    parser.add_argument("--step",      type=int,     help="Run only this step number")
+    parser.add_argument("--from-step", type=int,     help="Start from this step number")
     args = parser.parse_args()
 
-    if not Path(args.design).exists():
-        log.error(f"Design file not found: {args.design}")
-        sys.exit(1)
+    project_dir = Path(args.project_dir).resolve()
+
+    # Derive all paths from project_dir
+    docs_dir     = project_dir / "docs"
+    builder_dir  = project_dir / ".builder"
+    log_dir      = builder_dir / "logs"
+    plan_path    = builder_dir / "build_plan.json"
+    config_path  = builder_dir / "setup_config.json"
+    state_path   = builder_dir / "state.json"
+    orch_log     = log_dir / "orchestrator.log"
+
+    func_design  = docs_dir / "functional_design.md"
+    tech_design  = docs_dir / "technical_design.md"
+
+    # Create .builder/ directory structure
+    builder_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set module-level paths
+    _state_file = str(state_path)
+    _agent_log_dir = str(log_dir)
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        handlers=[
+            logging.FileHandler(str(orch_log)),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+    # Validate design docs exist
+    design_docs = []
+    for doc in [func_design, tech_design]:
+        if not doc.exists():
+            log.error(f"Design file not found: {doc}")
+            sys.exit(1)
+        design_docs.append(str(doc))
 
     state = load_state()
     if not state["started_at"]:
@@ -782,61 +818,67 @@ def main():
     script_dir = Path(__file__).resolve().parent
 
     log.info(f"Build Orchestrator")
-    log.info(f"Design     : {args.design}")
+    log.info(f"Project    : {project_dir}")
+    log.info(f"Design docs: {', '.join(d.name for d in [func_design, tech_design])}")
 
     # --- Phase 1: Planning ---
     skip_planning = (state.get("phase_planning") == "done"
-                     and Path(args.plan).exists())
+                     and plan_path.exists())
     if skip_planning:
         log.info(f"  [planning] skipping (already done)")
     else:
         if not run_phase("planning",
                          ["python3", str(script_dir / "planner.py"),
-                          args.design, "--plan", args.plan],
+                          *design_docs,
+                          "--plan", str(plan_path),
+                          "--log-dir", str(log_dir)],
                          state, "phase_planning"):
             sys.exit(1)
 
     # --- Phase 2: Setup Planning ---
     skip_setup_planning = (state.get("phase_setup_planning") == "done"
-                           and Path(args.config).exists())
+                           and config_path.exists())
     if skip_setup_planning:
         log.info(f"  [setup-planning] skipping (already done)")
     else:
         if not run_phase("setup-planning",
                          ["python3", str(script_dir / "setup_planner.py"),
-                          args.design, "--config", args.config],
+                          *design_docs,
+                          "--config", str(config_path),
+                          "--log-dir", str(log_dir)],
                          state, "phase_setup_planning"):
             sys.exit(1)
 
     # --- Phase 3: Setup ---
     if not run_phase("setup",
                      ["python3", str(script_dir / "setup.py"),
-                      "--config", args.config],
+                      "--config", str(config_path),
+                      "--log-dir", str(log_dir)],
                      state, "phase_setup"):
         sys.exit(1)
 
     # --- Phase 4: Build Steps ---
     # Load plan
-    if not Path(args.plan).exists():
-        log.error(f"Plan not found: {args.plan}")
+    if not plan_path.exists():
+        log.error(f"Plan not found: {plan_path}")
         sys.exit(1)
-    with open(args.plan) as f:
+    with open(plan_path) as f:
         plan = json.load(f)
 
     # Load config
-    if not Path(args.config).exists():
-        log.error(f"Config not found: {args.config}")
+    if not config_path.exists():
+        log.error(f"Config not found: {config_path}")
         sys.exit(1)
-    config = load_config(args.config)
+    config = load_config(str(config_path))
     apply_env_to_process(config)
-    project_dir = get_project_dir(config)
+    build_project_dir = get_project_dir(config)
     env_summary = build_env_summary(config)
     production_components = build_production_components(config)
     git_cfg = config.get("git", {})
 
-    log.info(f"Plan       : {args.plan}")
-    log.info(f"Config     : {args.config}")
-    log.info(f"Project dir: {project_dir}")
+    log.info(f"Plan       : {plan_path}")
+    log.info(f"Config     : {config_path}")
+    log.info(f"Project dir: {build_project_dir}")
 
     steps = plan["steps"]
     if args.step:
@@ -856,7 +898,7 @@ def main():
             log.info(f"Skipping step {n:02d} (already completed)")
             continue
 
-        success = run_step(step, project_dir, env_summary, production_components, state, git_cfg)
+        success = run_step(step, build_project_dir, env_summary, production_components, state, git_cfg)
 
         if success:
             state["completed_steps"].append(n)
@@ -870,7 +912,7 @@ def main():
             log.error("")
             log.error(f"Step {n:02d} FAILED. Orchestrator stopped.")
             log.error(f"Fix the issue then resume with:")
-            log.error(f"  python orchestrator.py {args.design} --from-step {n}")
+            log.error(f"  python orchestrator.py {project_dir} --from-step {n}")
             sys.exit(1)
 
         save_state(state)
