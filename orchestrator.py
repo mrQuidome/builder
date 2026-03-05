@@ -838,7 +838,7 @@ TECHNICAL_DESIGN_TEMPLATE = """\
 
 def cmd_init(args):
     """Create project folder with docs/ skeleton."""
-    project_dir = Path(args.project_dir).resolve()
+    project_dir = (Path("/opt") / args.project_dir).resolve()
 
     if project_dir.exists():
         print(f"Error: {project_dir} already exists")
@@ -895,7 +895,7 @@ def main():
         cmd_init(args)
         return
 
-    project_dir = Path(args.project_dir).resolve()
+    project_dir = (Path("/opt") / args.project_dir).resolve()
 
     # Derive all paths from project_dir
     docs_dir     = project_dir / "docs"
