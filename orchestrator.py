@@ -322,6 +322,37 @@ log = logging.getLogger(__name__)
 
 PHASE_ORDER = ["dev", "refactor", "security"]
 
+# ---------------------------------------------------------------------------
+# Time tracking
+# ---------------------------------------------------------------------------
+
+_timing = {
+    "claude": 0.0,       # cumulative seconds waiting on claude
+    "action": 0.0,       # cumulative seconds on everything else
+    "step_claude": 0.0,  # per-step claude seconds (reset each step)
+    "step_start": 0.0,   # monotonic timestamp when step began
+}
+
+
+def _fmt(seconds: float) -> str:
+    """Format seconds as  Xm Ys."""
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+def _log_step_timing(step_num: int):
+    """Log timing breakdown for a completed step + cumulative."""
+    elapsed = time.monotonic() - _timing["step_start"]
+    step_claude = _timing["step_claude"]
+    step_action = max(elapsed - step_claude, 0.0)
+
+    _timing["action"] += step_action
+
+    log.info("")
+    log.info(f"  [timing] Step {step_num:02d}:  claude {_fmt(step_claude)}  |  action {_fmt(step_action)}  |  total {_fmt(elapsed)}")
+    log.info(f"  [timing] Cumulative: claude {_fmt(_timing['claude'])}  |  action {_fmt(_timing['action'])}  |  total {_fmt(_timing['claude'] + _timing['action'])}")
+
+
 # Set in main() so all functions can access the state file path
 _state_file: str = ""
 
@@ -399,6 +430,7 @@ def run_claude(prompt: str, step_num: int, agent: str, project_dir: str) -> str:
     stderr_path = log_dir / f"step_{step_num:02d}_{agent}_{ts}_stderr.log"
     log.info(f"  [{agent}] invoking claude...  stdout -> {stdout_path}")
 
+    t0 = time.monotonic()
     with open(stdout_path, "w") as fout, open(stderr_path, "w") as ferr:
         try:
             proc = subprocess.Popen(
@@ -414,12 +446,20 @@ def run_claude(prompt: str, step_num: int, agent: str, project_dir: str) -> str:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+            elapsed = time.monotonic() - t0
+            _timing["claude"] += elapsed
+            _timing["step_claude"] += elapsed
             restore_terminal()
             log.error(f"  [{agent}] timed out after {CLAUDE_TIMEOUT}s")
             return "AGENT_RESULT: FAILED\nREASON: timeout"
         except FileNotFoundError:
             log.error("claude CLI not found — is it installed and on PATH?")
             sys.exit(1)
+
+    elapsed = time.monotonic() - t0
+    _timing["claude"] += elapsed
+    _timing["step_claude"] += elapsed
+    log.info(f"  [{agent}] claude returned in {_fmt(elapsed)}")
 
     if proc.returncode != 0:
         restore_terminal()
@@ -627,6 +667,8 @@ def run_step(step: dict, project_dir: str, env_summary: str,
              production_components: str, state: dict, git_cfg: dict) -> bool:
     n = step["step"]
     done = _completed_phases(state, n)
+    _timing["step_claude"] = 0.0
+    _timing["step_start"] = time.monotonic()
     log.info("")
     log.info(f"{'='*60}")
     log.info(f"STEP {n:02d}: {step['title']}")
@@ -744,6 +786,7 @@ def run_step(step: dict, project_dir: str, env_summary: str,
     # Step complete — clean up phase tracking
     state.get("step_phases", {}).pop(str(n), None)
 
+    _log_step_timing(n)
     log.info("")
     log.info(f"  STEP {n:02d} COMPLETE")
     return True
@@ -1030,12 +1073,15 @@ def main():
             if n in state.get("failed_steps", []):
                 state["failed_steps"].remove(n)
         else:
+            _log_step_timing(n)
             state.setdefault("failed_steps", [])
             if n not in state["failed_steps"]:
                 state["failed_steps"].append(n)
             save_state(state)
             log.error("")
             log.error(f"Step {n:02d} FAILED. Orchestrator stopped.")
+            total = _timing["claude"] + _timing["action"]
+            log.error(f"  [timing] Final:  claude {_fmt(_timing['claude'])}  |  action {_fmt(_timing['action'])}  |  total {_fmt(total)}")
             log.error(f"Fix the issue then resume with:")
             log.error(f"  python orchestrator.py {project_dir} --from-step {n}")
             sys.exit(1)
@@ -1046,6 +1092,11 @@ def main():
     log.info(f"{'='*60}")
     log.info(f"ALL {len(steps)} STEPS COMPLETE")
     log.info(f"{'='*60}")
+    total = _timing["claude"] + _timing["action"]
+    log.info(f"  [timing] Final:  claude {_fmt(_timing['claude'])}  |  action {_fmt(_timing['action'])}  |  total {_fmt(total)}")
+    if total > 0:
+        pct = _timing["claude"] / total * 100
+        log.info(f"  [timing] Claude accounted for {pct:.0f}% of total time")
 
 
 if __name__ == "__main__":
