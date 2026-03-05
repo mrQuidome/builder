@@ -9,9 +9,10 @@ Single entry point that runs the full pipeline:
   4. Build Steps    — Dev -> Test -> Refactor -> Security    (existing logic)
 
 Usage:
-    python orchestrator.py /opt/auth-service
-    python orchestrator.py /opt/auth-service --step 7          # run a single step only
-    python orchestrator.py /opt/auth-service --from-step 5     # resume from step 5
+    python orchestrator.py init my-project                     # scaffold a new project
+    python orchestrator.py build /opt/auth-service             # run the full pipeline
+    python orchestrator.py build /opt/auth-service --step 7    # run a single step only
+    python orchestrator.py build /opt/auth-service --from-step 5  # resume from step 5
 
 The project folder must contain:
     docs/functional_design.md
@@ -758,6 +759,100 @@ def run_phase(phase_name: str, cmd: list[str], state: dict, state_key: str) -> b
 
 
 # ---------------------------------------------------------------------------
+# Init
+# ---------------------------------------------------------------------------
+
+FUNCTIONAL_DESIGN_TEMPLATE = """\
+# Functional Design — {name}
+
+## 1. Overview
+<!-- What is this project? One paragraph summary. -->
+
+## 2. Goals
+<!-- What should the finished product achieve? Bullet list. -->
+
+## 3. User Roles
+<!-- Who uses the system? (e.g. admin, end-user, API consumer) -->
+
+## 4. Features
+<!-- Describe each feature. For each one:
+     - What it does
+     - Inputs / outputs
+     - Acceptance criteria
+-->
+
+### 4.1 Feature A
+### 4.2 Feature B
+
+## 5. Constraints & Assumptions
+<!-- Anything the builder should know: rate limits, compliance, SLAs, etc. -->
+"""
+
+TECHNICAL_DESIGN_TEMPLATE = """\
+# Technical Design — {name}
+
+## 1. Tech Stack
+<!-- Languages, frameworks, and versions. Be specific.
+     e.g. Rust 1.78, Actix-web 4, PostgreSQL 16, Node 20 -->
+
+## 2. Architecture
+<!-- High-level components and how they connect.
+     e.g. REST API server + PostgreSQL + Redis cache -->
+
+## 3. Data Models
+<!-- Database tables / schemas. Include columns, types, relations. -->
+
+## 4. API Specification
+<!-- Endpoints, methods, request/response formats. -->
+
+## 5. Services & Infrastructure
+<!-- Databases, caches, reverse proxies, queues, etc.
+     Include systemd units and config file paths if relevant. -->
+
+## 6. Environment Variables
+<!-- List every env var the app needs.
+     Mark each as: static value | auto-generated secret | external credential -->
+
+## 7. Directory Structure
+<!-- Where does the source code live? e.g. /opt/my-project -->
+
+## 8. Testing Strategy
+<!-- How to run tests, what coverage is expected. -->
+
+## 9. Security Considerations
+<!-- Auth method, input validation, secrets handling, TLS, etc. -->
+"""
+
+
+def cmd_init(args):
+    """Create project folder with docs/ skeleton."""
+    project_dir = Path(args.project_dir).resolve()
+
+    if project_dir.exists():
+        print(f"Error: {project_dir} already exists")
+        sys.exit(1)
+
+    docs_dir = project_dir / "docs"
+    docs_dir.mkdir(parents=True)
+
+    name = project_dir.name
+
+    func_path = docs_dir / "functional_design.md"
+    tech_path = docs_dir / "technical_design.md"
+
+    func_path.write_text(FUNCTIONAL_DESIGN_TEMPLATE.format(name=name))
+    tech_path.write_text(TECHNICAL_DESIGN_TEMPLATE.format(name=name))
+
+    print(f"Project initialised: {project_dir}")
+    print(f"  {docs_dir / 'functional_design.md'}")
+    print(f"  {docs_dir / 'technical_design.md'}")
+    print()
+    print("Next steps:")
+    print("  1. Fill in the design documents")
+    print(f"  2. python orchestrator.py build {project_dir}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -765,10 +860,28 @@ def main():
     global _state_file, _agent_log_dir
 
     parser = argparse.ArgumentParser(description="Build Orchestrator")
-    parser.add_argument("project_dir",               help="Path to project folder")
-    parser.add_argument("--step",      type=int,     help="Run only this step number")
-    parser.add_argument("--from-step", type=int,     help="Start from this step number")
+    sub = parser.add_subparsers(dest="command")
+
+    # --- init ---
+    p_init = sub.add_parser("init", help="Scaffold a new project folder")
+    p_init.add_argument("project_dir", help="Name or path for the new project")
+
+    # --- build (default) ---
+    p_build = sub.add_parser("build", help="Run the build pipeline")
+    p_build.add_argument("project_dir",               help="Path to project folder")
+    p_build.add_argument("--step",      type=int,     help="Run only this step number")
+    p_build.add_argument("--from-step", type=int,     help="Start from this step number")
+
     args = parser.parse_args()
+
+    # Backwards compat: bare path without subcommand
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.command == "init":
+        cmd_init(args)
+        return
 
     project_dir = Path(args.project_dir).resolve()
 
