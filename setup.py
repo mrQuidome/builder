@@ -51,6 +51,10 @@ ENV VARS AVAILABLE:
 {env_json}
 
 INSTRUCTIONS:
+- IMPORTANT: First run the validate_cmd to check if the tool is already installed.
+  If the output already contains validate_expect, skip installation entirely and
+  report AGENT_RESULT: DONE.
+- Only install if the tool is missing or the wrong version.
 - Follow the install_method and install_notes exactly.
 - After installing, run the validate_cmd and confirm the output contains validate_expect.
 - Do not install anything not listed in the tool spec.
@@ -72,6 +76,15 @@ ENV VARS AVAILABLE:
 {env_json}
 
 INSTRUCTIONS:
+- IMPORTANT: This VPS may already have services from other projects. Check before
+  you act and skip steps that are already done:
+  * Check if the package/service is already installed before installing it.
+  * Check if the systemd unit already exists and is running before enabling/starting.
+  * For database services: check if the database user already exists before creating
+    (e.g. SELECT 1 FROM pg_roles WHERE rolname='<user>'). Check if the database
+    already exists before creating. Still ensure required extensions are enabled.
+  * For config files: only modify settings that differ from what is needed. Do not
+    overwrite config files that are already correct.
 - For database services (e.g. postgresql): create the database user and database
   using the credentials from the env vars. Extract the username, password, and
   database name from DATABASE_URL. Enable required extensions (e.g. PostGIS,
@@ -122,6 +135,13 @@ PROJECT DIRS — create these directories if they don't exist:
 {dirs_json}
 
 INSTRUCTIONS:
+- IMPORTANT: This VPS may already have environment and directories from other
+  projects. Check before you act and skip steps that are already done:
+  * For each env var, check if it already exists in /etc/environment with the
+    correct value before writing. Only add or update vars that are missing or
+    different.
+  * For directories, skip creation if they already exist.
+  * For git init, skip if the directory is already a git repository.
 - Append or update each variable in /etc/environment.
 - Create all project directories with appropriate permissions.
 - Run `git init` inside each project directory so they are ready for version control.
@@ -439,8 +459,53 @@ def run_env_setup(config: dict) -> bool:
         return False
 
 
+def check_already_installed(tool: dict) -> bool:
+    """Run validate_cmd to check if a tool is already installed and valid."""
+    validate_cmd = tool.get("validate_cmd", "").strip()
+    validate_expect = tool.get("validate_expect", "").strip()
+    if not validate_cmd or not validate_expect:
+        return False
+    try:
+        result = subprocess.run(
+            validate_cmd, shell=True, capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout + result.stderr
+        if validate_expect in output:
+            return True
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return False
+
+
+def check_service_healthy(service: dict) -> bool:
+    """Run validate_cmd to check if a service is already configured and healthy."""
+    if service.get("defer_validation", False):
+        return False
+    validate_cmd = service.get("validate_cmd", "").strip()
+    validate_expect = service.get("validate_expect", "").strip()
+    if not validate_cmd or not validate_expect:
+        return False
+    try:
+        result = subprocess.run(
+            validate_cmd, shell=True, capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout + result.stderr
+        if validate_expect in output:
+            return True
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return False
+
+
 def run_tool_install(tool: dict, config: dict) -> bool:
     name = tool["name"]
+
+    # Pre-check: skip if already installed and valid
+    if check_already_installed(tool):
+        log.info(f"\n  Tool already installed: {name} — skipping")
+        record_result(config, "tool", name, "ok (pre-installed)", tool["version"])
+        return True
+
     log.info(f"\n  Installing tool: {name} ({tool['version']})")
 
     prompt = INSTALL_TOOL_PROMPT.format(
@@ -616,9 +681,11 @@ def main():
             sys.exit(1)
 
     # --- Summary ---
+    results = config.get("install_results", [])
+    pre_installed = sum(1 for r in results if "pre-installed" in r.get("status", ""))
     log.info(f"\n{'='*60}")
     log.info(f"SETUP COMPLETE")
-    log.info(f"  Tools    : {len(config['tools'])} installed")
+    log.info(f"  Tools    : {len(config['tools'])} total ({pre_installed} already installed, skipped)")
     log.info(f"  Services : {len(config['services'])} configured")
     log.info(f"  Results  : {config_path}")
     log.info(f"{'='*60}")
