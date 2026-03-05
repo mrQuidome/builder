@@ -41,6 +41,9 @@ OUTPUT RULES:
 - Output ONLY a single valid JSON object. No markdown, no explanation, no code fences.
 - Extract every tool, version, credential placeholder, environment variable,
   and configuration choice mentioned in the design.
+- VERSION POLICY: If the design specifies an exact version, use it. If no version is
+  specified, use "latest stable". Never use alpha, beta, release-candidate, or
+  pre-release versions.
 - For each secret, classify its source:
   - "generate" — the setup agent can create this itself (database passwords,
     JWT signing keys, database connection strings, any secret that does not
@@ -60,7 +63,7 @@ OUTPUT RULES:
     "tools": [
       {{
         "name": "<tool name>",
-        "version": "<pinned version or 'latest stable'>",
+        "version": "<pinned version from the design, or 'latest stable' if not specified>",
         "install_method": "<apt | cargo | wget | build_from_source | pip | npm>",
         "install_notes": "<any special steps from the design>",
         "validate_cmd": "<command to confirm install succeeded>",

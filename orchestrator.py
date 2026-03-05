@@ -71,6 +71,12 @@ ALLOWED during this step:
 - Installing dev/build tooling (clippy, rustfmt, cargo-watch, test runners, linters)
 - Writing and running tests
 
+VERSION POLICY for all dependencies:
+- Always install the latest stable release unless the design specifies an exact version.
+- Never install alpha, beta, release-candidate, or pre-release versions.
+- When adding dependencies, do not pin to old versions unless there is a specific
+  compatibility reason.
+
 NOT ALLOWED during this step:
 - Installing or configuring new databases, queues, or caches not already in the
   production components list above
@@ -150,7 +156,7 @@ Check for security issues:
 - Unsafe unwraps on user-controlled input
 - Missing or insufficient input validation
 - Path traversal vulnerabilities
-- Insecure or unpinned dependencies
+- Insecure dependencies or use of alpha/beta/pre-release versions
 
 Check for scope violations:
 - Any new production infrastructure introduced (databases, queues, services,
@@ -199,6 +205,8 @@ INSTRUCTIONS:
 - The Definition of Done for the step must still be fully met.
 - Run builds and tests after your fixes to confirm everything passes.
 - Stay inside the project directory.
+- VERSION POLICY: If you need to add or update dependencies, always use the latest
+  stable release. Never use alpha, beta, release-candidate, or pre-release versions.
 
 When all test failures are fixed, output:
   AGENT_RESULT: DONE
@@ -255,6 +263,8 @@ INSTRUCTIONS:
   (e.g. /etc/nginx/, /etc/systemd/, service configs) as needed.
 - Run builds and tests after your fixes to confirm nothing broke.
 - If a fix requires restarting a service (e.g. nginx, martin), do so.
+- VERSION POLICY: If you need to add or update dependencies, always use the latest
+  stable release. Never use alpha, beta, release-candidate, or pre-release versions.
 
 When all security issues are fixed, output:
   AGENT_RESULT: DONE
@@ -290,6 +300,8 @@ INSTRUCTIONS:
 - Do not change functionality or public interfaces beyond what is needed.
 - Run builds and tests after your changes to confirm everything passes.
 - If a fix requires restarting a service (e.g. nginx, martin), do so.
+- VERSION POLICY: If you need to add or update dependencies, always use the latest
+  stable release. Never use alpha, beta, release-candidate, or pre-release versions.
 
 When all security issues are fixed and tests pass, output:
   AGENT_RESULT: DONE

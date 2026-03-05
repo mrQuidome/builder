@@ -55,6 +55,8 @@ INSTRUCTIONS:
   If the output already contains validate_expect, skip installation entirely and
   report AGENT_RESULT: DONE.
 - Only install if the tool is missing or the wrong version.
+- VERSION POLICY: If the spec says "latest stable", install the latest stable release.
+  Never install alpha, beta, release-candidate, or pre-release versions.
 - Follow the install_method and install_notes exactly.
 - After installing, run the validate_cmd and confirm the output contains validate_expect.
 - Do not install anything not listed in the tool spec.
@@ -85,6 +87,9 @@ INSTRUCTIONS:
     already exists before creating. Still ensure required extensions are enabled.
   * For config files: only modify settings that differ from what is needed. Do not
     overwrite config files that are already correct.
+- VERSION POLICY: When installing packages, always use the latest stable release
+  unless a specific version is given. Never install alpha, beta, release-candidate,
+  or pre-release versions.
 - For database services (e.g. postgresql): create the database user and database
   using the credentials from the env vars. Extract the username, password, and
   database name from DATABASE_URL. Enable required extensions (e.g. PostGIS,
